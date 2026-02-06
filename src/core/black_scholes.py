@@ -1,0 +1,44 @@
+"""
+black_scholes.py
+
+Implements the Black-Scholes analytical formula for European options.
+Formula:
+C = S0 * N(d1) - K * exp(-rT) * N(d2)
+d1 = (ln(S0/K) + (r + sigma^2/2)T) / (sigma * sqrt(T))
+d2 = d1 - sigma * sqrt(T)
+"""
+
+import numpy as np
+
+from scipy.stats import norm
+
+def black_scholes_price(S0, K, T, r, sigma, option_type='call'):
+    """
+    Calculates the analytical Black-Scholes price for a European option.
+    
+    Inputs:
+        S0: Current asset price (float or np.ndarray)
+        K: Strike price (float or np.ndarray)
+        T: Time to maturity (float or np.ndarray)
+        r: Risk-free rate (float or np.ndarray)
+        sigma: Volatility (float or np.ndarray)
+        option_type: 'call' or 'put' (str)
+        
+    Output:
+        price: NumPy array or scalar of option prices
+    """
+    # d1 = (ln(S0/K) + (r + sigma^2/2)T) / (sigma * sqrt(T))
+    # d2 = d1 - sigma * sqrt(T)
+    
+    sqrt_T = np.sqrt(T)
+    d1 = (np.log(S0 / K) + (r + 0.5 * sigma**2) * T) / (sigma * sqrt_T)
+    d2 = d1 - sigma * sqrt_T
+    
+    if option_type == 'call':
+        price = S0 * norm.cdf(d1) - K * np.exp(-r * T) * norm.cdf(d2)
+    elif option_type == 'put':
+        price = K * np.exp(-r * T) * norm.cdf(-d2) - S0 * norm.cdf(-d1)
+    else:
+        raise ValueError("option_type must be 'call' or 'put'")
+        
+    return price
