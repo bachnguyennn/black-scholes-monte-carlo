@@ -9,13 +9,20 @@ d2 = d1 - sigma * sqrt(T)
 """
 
 import numpy as np
-
 from scipy.stats import norm
 
 def black_scholes_price(S0, K, T, r, sigma, option_type='call'):
     """
     Calculates the analytical Black-Scholes price for a European option.
     
+    Formula:
+    C = S0 * N(d1) - K * exp(-rT) * N(d2)
+    P = K * exp(-rT) * N(-d2) - S0 * N(-d1)
+    
+    where:
+    d1 = (ln(S0/K) + (r + sigma^2/2)T) / (sigma * sqrt(T))
+    d2 = d1 - sigma * sqrt(T)
+
     Inputs:
         S0: Current asset price (float or np.ndarray)
         K: Strike price (float or np.ndarray)
@@ -27,9 +34,11 @@ def black_scholes_price(S0, K, T, r, sigma, option_type='call'):
     Output:
         price: NumPy array or scalar of option prices
     """
-    # d1 = (ln(S0/K) + (r + sigma^2/2)T) / (sigma * sqrt(T))
-    # d2 = d1 - sigma * sqrt(T)
-    
+    if T <= 0:
+        raise ValueError("Time to maturity (T) must be positive.")
+    if sigma <= 0:
+        raise ValueError("Volatility (sigma) must be positive.")
+
     sqrt_T = np.sqrt(T)
     d1 = (np.log(S0 / K) + (r + 0.5 * sigma**2) * T) / (sigma * sqrt_T)
     d2 = d1 - sigma * sqrt_T

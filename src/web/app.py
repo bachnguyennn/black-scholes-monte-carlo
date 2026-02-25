@@ -3,14 +3,19 @@ import streamlit as st
 import numpy as np
 import plotly.graph_objects as go
 import plotly.express as px
+import pandas as pd
 import sys
 import os
+import yfinance as yf
+from datetime import timedelta, date
 
 # Ensure src module is in path
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
 
 from src.core.black_scholes import black_scholes_price
 from src.core.gbm_engine import simulate_gbm
+from src.core.jump_diffusion import simulate_jump_diffusion, simulate_jump_diffusion_paths
+from src.core.greeks import calculate_all_greeks
 
 # --- Page Config ---
 st.set_page_config(
@@ -20,345 +25,239 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# --- CSS to fix padding ---
+# --- CSS ---
 st.markdown("""
     <style>
     .main .block-container {
-        padding-top: 2rem;
+        padding-top: 1.5rem;
         padding-bottom: 2rem;
+    }
+    .stMetric {
+        background-color: rgba(240, 242, 246, 0.1);
+        padding: 10px;
+        border-radius: 5px;
     }
     </style>
 """, unsafe_allow_html=True)
 
-# --- Helper Function for Visualization ONLY ---
-def _simulate_paths_for_plot(S0, T, r, sigma, n_paths, n_steps=100):
-    """
-    LOCAL HELPER: Generates full price paths for visualization.
-    NOTE: The core engine 'simulate_gbm' is optimized for pricing (only returns terminal values).
-    This function duplicates the path logic strictly for the UI chart.
-    """
-    dt = T / n_steps
-    # Z ~ N(0, 1)
-    Z = np.random.standard_normal((n_paths, n_steps))
-    
-    drift = (r - 0.5 * sigma**2) * dt
-    diffusion = sigma * np.sqrt(dt) * Z
-    
-    log_returns = drift + diffusion
-    
-    # Cumulative sum for paths
-    cumulative_log_returns = np.zeros((n_paths, n_steps + 1))
-    cumulative_log_returns[:, 1:] = np.cumsum(log_returns, axis=1)
-    
-    return S0 * np.exp(cumulative_log_returns)
-
 # --- Title ---
 st.title("💰 European Option Pricing: Monte Carlo vs Black-Scholes")
-st.markdown("---")
 
-import yfinance as yf
+# ============================================================================
+# SIDEBAR
+# ============================================================================
 
-# --- Sidebar Inputs ---
+st.sidebar.header("Asset Selection")
+
+ticker = st.sidebar.text_input(
+    "Ticker Symbol", 
+    value="SPY",
+    help="Enter a Yahoo Finance ticker (e.g., AAPL, SPY, ^TYX for Bonds)."
+)
+
+@st.cache_data(ttl=3600)
+def fetch_asset_data(symbol):
+    try:
+        asset = yf.Ticker(symbol)
+        info = asset.info
+        history = asset.history(period="1y")
+        if history.empty:
+            return None
+        log_returns = np.log(history['Close'] / history['Close'].shift(1))
+        vol = log_returns.std() * np.sqrt(252)
+        return {
+            'price': history['Close'].iloc[-1],
+            'vol': vol,
+            'history': history['Close'],
+            'name': info.get('longName', symbol)
+        }
+    except:
+        return None
+
+asset_data = fetch_asset_data(ticker)
+
+if asset_data:
+    st.sidebar.success(f"Loaded: {asset_data['name']}")
+    default_spot = float(asset_data['price'])
+    default_vol = float(asset_data['vol'])
+    default_vol = min(max(default_vol, 0.05), 1.0)
+else:
+    st.sidebar.warning("Using manual defaults.")
+    default_spot = 100.0
+    default_vol = 0.2
+
+st.sidebar.markdown("---")
 st.sidebar.header("Model Parameters")
 
-# Ticker Input for Auto-Fetching
-ticker = st.sidebar.text_input("Ticker Symbol (e.g., AAPL)", value="")
+model_type = st.sidebar.radio(
+    "Choose Simulation Model",
+    ["Standard GBM", "Jump Diffusion (Crash Model)"],
+    help="GBM: Smooth continuous paths. Jump Diffusion: Includes crash events."
+)
 
-# Dynamic Default Values
-default_spot = 100.0
-default_vol = 0.2
-
-if ticker:
-    try:
-        stock = yf.Ticker(ticker)
-        history = stock.history(period="1d")
-        if not history.empty:
-            spot = history['Close'].iloc[-1]
-            default_spot = float(spot)
-            st.sidebar.success(f"Fetched {ticker}: ${default_spot:.2f}")
-            
-            # Lock Spot Price to Fetched Value
-            current_price = default_spot
-            st.sidebar.metric("Spot Price ($S_0$)", f"${current_price:.2f}")
-        else:
-            st.sidebar.error("Ticker not found or no data.")
-            current_price = st.sidebar.slider("Spot Price ($S_0$)", min_value=10.0, max_value=2000.0, value=default_spot, step=0.5)
-    except Exception as e:
-        st.sidebar.error(f"Error fetching data: {e}")
-        current_price = st.sidebar.slider("Spot Price ($S_0$)", min_value=10.0, max_value=2000.0, value=default_spot, step=0.5)
+if model_type == "Jump Diffusion (Crash Model)":
+    st.sidebar.markdown("### Crash Parameters")
+    jump_intensity = st.sidebar.slider("Crash Intensity (λ)", 0.0, 1.0, 0.1, 0.05)
+    jump_mean = st.sidebar.slider("Average Crash Size (%)", -20, 0, -5, 1) / 100
+    jump_std = st.sidebar.slider("Crash Volatility (%)", 1, 10, 3, 1) / 100
 else:
-    # Manual Input
-    current_price = st.sidebar.slider("Spot Price ($S_0$)", min_value=10.0, max_value=2000.0, value=default_spot, step=0.5)
+    jump_intensity, jump_mean, jump_std = 0.0, 0.0, 0.0
 
+st.sidebar.markdown("---")
 option_type = st.sidebar.radio("Option Type", ["Call", "Put"])
-strike_price = st.sidebar.slider("Strike Price ($K$)", min_value=10.0, max_value=2000.0, value=default_spot, step=0.5)
-time_to_maturity = st.sidebar.slider("Time to Maturity ($T$ Years)", min_value=0.1, max_value=5.0, value=1.0, step=0.1)
-risk_free_rate = st.sidebar.slider("Risk-Free Rate ($r$)", min_value=0.0, max_value=0.2, value=0.05, step=0.01)
-volatility = st.sidebar.slider("Volatility ($\sigma$)", min_value=0.05, max_value=1.5, value=default_vol, step=0.05)
+current_price = st.sidebar.slider("Spot Price ($S_0$)", 1.0, 2000.0, default_spot, 1.0)
+strike_price = st.sidebar.slider("Strike Price ($K$)", 1.0, 2000.0, default_spot, 1.0)
+time_to_maturity = st.sidebar.slider("Time to Maturity ($T$ Years)", 0.1, 5.0, 1.0, 0.1)
+risk_free_rate = st.sidebar.slider("Risk-Free Rate ($r$)", 0.0, 0.2, 0.05, 0.01)
+volatility = st.sidebar.slider("Volatility (σ)", 0.05, 1.5, default_vol, 0.05)
 
 st.sidebar.markdown("---")
-st.sidebar.header("Market Data (Optional)")
-market_price = st.sidebar.number_input("Current Market Price ($)", min_value=0.0, value=0.0, step=0.1)
+market_price = st.sidebar.number_input("Market Price ($)", 0.0, value=0.0, step=0.1)
+n_sims = st.sidebar.slider("Simulations ($N$)", 100, 100000, 10000, 100)
 
-st.sidebar.markdown("---")
-st.sidebar.header("Simulation Settings")
-n_sims = st.sidebar.slider("Number of Simulations ($N$)", min_value=100, max_value=100000, value=10000, step=100)
+# ============================================================================
+# CALCULATION ENGINE
+# ============================================================================
 
-# --- Main Logic ---
+def _simulate_gbm_paths_for_plot(S0, T, r, sigma, n_paths, n_steps=60):
+    dt = T / n_steps
+    Z = np.random.standard_normal((n_paths, n_steps))
+    drift = (r - 0.5 * sigma**2) * dt
+    diffusion = sigma * np.sqrt(dt) * Z
+    log_returns = drift + diffusion
+    cumulative_log_returns = np.zeros((n_paths, n_steps + 1))
+    cumulative_log_returns[:, 1:] = np.cumsum(log_returns, axis=1)
+    return S0 * np.exp(cumulative_log_returns)
 
-# 1. Black-Scholes Benchmark
-bs_price = black_scholes_price(current_price, strike_price, time_to_maturity, risk_free_rate, volatility, option_type=option_type.lower())
+# 1. Prices
+bs_price = black_scholes_price(current_price, strike_price, time_to_maturity, risk_free_rate, volatility, option_type.lower())
 
-# 2. Monte Carlo Simulation (Pricing)
-# Correctly uses the strict core engine (returns terminal prices S_T)
-S_T = simulate_gbm(current_price, time_to_maturity, risk_free_rate, volatility, n_sims)
+if model_type == "Jump Diffusion (Crash Model)":
+    S_T, crash_mask = simulate_jump_diffusion(current_price, time_to_maturity, risk_free_rate, volatility, n_sims, jump_intensity, jump_mean, jump_std)
+else:
+    S_T = simulate_gbm(current_price, time_to_maturity, risk_free_rate, volatility, n_sims)
+    crash_mask = np.zeros(n_sims, dtype=bool)
 
-# Payoffs
+# 2. Results
 if option_type == "Call":
     payoffs = np.maximum(S_T - strike_price, 0)
-else: # Put
+else:
     payoffs = np.maximum(strike_price - S_T, 0)
 
 mc_price = np.exp(-risk_free_rate * time_to_maturity) * np.mean(payoffs)
-
-# Standard Error
 std_error = np.std(payoffs) / np.sqrt(n_sims) * np.exp(-risk_free_rate * time_to_maturity)
 
-# 3. Path Visualization (UI Only)
-n_plot_paths = 50
-paths = _simulate_paths_for_plot(current_price, time_to_maturity, risk_free_rate, volatility, n_plot_paths)
-time_axis = np.linspace(0, time_to_maturity, paths.shape[1])
-
-# --- Display Results ---
-
-# Metrics Row
-col1, col2, col3 = st.columns(3)
+# ============================================================================
+# LAYOUT TOP: METRICS
+# ============================================================================
+col1, col2, col3, col4 = st.columns(4)
 
 with col1:
-    st.metric(f"Black-Scholes ({option_type})", f"${bs_price:.4f}")
-
+    st.metric("Black-Scholes", f"${bs_price:.4f}")
 with col2:
     delta = mc_price - bs_price
-    st.metric(f"Monte Carlo ({option_type})", f"${mc_price:.4f}", delta=f"{delta:.4f}", delta_color="inverse")
-
+    st.metric("Monte Carlo", f"${mc_price:.4f}", delta=f"{delta:.4f}", delta_color="inverse")
 with col3:
     st.metric("Standard Error", f"±${std_error:.4f}")
+with col4:
+    if model_type == "Jump Diffusion (Crash Model)":
+        cp = np.sum(crash_mask) / n_sims * 100
+        st.metric("Crash Prob", f"{cp:.1f}%")
+    else:
+        st.metric("Risk Model", "GBM")
 
-# Recommendation Row
-if market_price > 0:
-    st.markdown("### 🤖 AI Trading Signal")
-    rec_col1, rec_col2 = st.columns([1, 3])
-    
-    model_price = bs_price # Trust BS more for single recommendation, or user could choose
-    
-    # Logic: 
-    # If Model > Market => It's Cheap => BUY
-    # If Model < Market => It's Expensive => SELL
-    
-    diff = model_price - market_price
-    pct_diff = (diff / market_price) * 100
-    
-    with rec_col1:
-        if diff > 0:
-            st.success("✅ BUY", icon="🤑")
-        else:
-            st.error("❌ SELL", icon="💸")
-            
-    with rec_col2:
-        if diff > 0:
-            st.info(f"The option is **UNDERVALUED** by {pct_diff:.1f}%. Fair Value is ${model_price:.2f}, but Market says ${market_price:.2f}.")
-        else:
-            st.info(f"The option is **OVERVALUED** by {-pct_diff:.1f}%. Fair Value is ${model_price:.2f}, but Market says ${market_price:.2f}.")
-
+# ============================================================================
+# LAYOUT: CHARTS
+# ============================================================================
 st.markdown("---")
 
-# Charts Row
-chart_col, hist_col = st.columns(2)
-
-# --- Simulation & Visualization Logic ---
-
-# 1. Generate Future Paths
-# We need full paths now, not just terminal prices for the plot
-# Using the local helper _simulate_paths_for_plot
+# 1. HISTORICAL + PROJECTION (Full Width)
+st.subheader("Asset Price Projections")
 n_plot_paths = 50
-sim_paths = _simulate_paths_for_plot(current_price, time_to_maturity, risk_free_rate, volatility, n_plot_paths)
-
-# 2. Date Handling
-import pandas as pd
-from datetime import timedelta, date
-
-history_data = None
-future_dates = []
-
-if ticker:
-    try:
-        # Fetch 1 year history
-        stock = yf.Ticker(ticker)
-        history = stock.history(period="1y")
-        if not history.empty:
-            history_data = history['Close']
-            last_date = history.index[-1].date()
-    except:
-        last_date = date.today()
+if model_type == "Jump Diffusion (Crash Model)":
+    sim_paths, path_crash_mask = simulate_jump_diffusion_paths(current_price, time_to_maturity, risk_free_rate, volatility, n_plot_paths, jump_intensity, jump_mean, jump_std)
 else:
-    # Synthetic history for manual mode (just a flat line or empty)
-    last_date = date.today()
+    sim_paths = _simulate_gbm_paths_for_plot(current_price, time_to_maturity, risk_free_rate, volatility, n_plot_paths)
+    path_crash_mask = np.zeros(n_plot_paths, dtype=bool)
 
-# Generate Future Dates
-# Logic: Start from last_date, add days corresponding to simulation steps
-n_steps = sim_paths.shape[1]
-# Total days ~ T * 365
-days_total = int(time_to_maturity * 365)
-if days_total == 0: days_total = 1 # Safety
-days_step = days_total / n_steps
+time_axis = np.linspace(0, time_to_maturity, sim_paths.shape[1])
 
-future_dates = [last_date + timedelta(days=int(i * days_step)) for i in range(n_steps + 1)]
+fig_paths = go.Figure()
 
+# History
+if asset_data and 'history' in asset_data:
+    history = asset_data['history']
+    x_hist = np.linspace(-len(history)/252, 0, len(history))
+    fig_paths.add_trace(go.Scatter(x=x_hist, y=history.values, mode='lines', name='Historical', line=dict(color='green', width=2)))
 
-# 3. Plotting Combined Chart
-fig_combined = go.Figure()
-
-# Plot History (if exists)
-if history_data is not None:
-    fig_combined.add_trace(go.Scatter(
-        x=history_data.index, 
-        y=history_data.values,
-        mode='lines',
-        name='Historical Price',
-        line=dict(color='black', width=2)
-    ))
-
-# Plot Future Paths
-# Connect the start of simulation to the end of history if possible
-# Note: sim_paths[i][0] is S0.
+# Paths
 for i in range(n_plot_paths):
-    fig_combined.add_trace(go.Scatter(
-        x=future_dates, 
-        y=sim_paths[i],
-        mode='lines',
-        line=dict(width=1, color='rgba(0, 100, 255, 0.2)'),
-        showlegend=False,
-        hoverinfo='skip' 
-    ))
+    color = 'rgba(255, 50, 50, 0.3)' if path_crash_mask[i] else 'rgba(0, 100, 255, 0.2)'
+    fig_paths.add_trace(go.Scatter(x=time_axis, y=sim_paths[i], mode='lines', line=dict(width=1, color=color), showlegend=False, hoverinfo='skip'))
 
-# Plot Strike Price Line (Future only)
-fig_combined.add_shape(
-    type="line",
-    x0=future_dates[0], y0=strike_price,
-    x1=future_dates[-1], y1=strike_price,
-    line=dict(color="red", width=2, dash="dash"),
-    name="Strike Price"
-)
-fig_combined.add_trace(go.Scatter(
-    x=[future_dates[-1]], y=[strike_price],
-    text=["Strike"], mode="text", showlegend=False
-))
+fig_paths.add_hline(y=strike_price, line_dash="dash", line_color="red", annotation_text="Strike")
+fig_paths.update_layout(xaxis_title="Years from Today", yaxis_title="Price ($)", height=450, hovermode="x unified", margin=dict(l=0, r=0, t=20, b=0))
+st.plotly_chart(fig_paths, use_container_width=True)
 
-fig_combined.update_layout(
-    title=f"Historical Price + Monte Carlo Projections ({n_plot_paths} Paths)",
-    xaxis_title="Date",
-    yaxis_title="Price ($)",
-    hovermode="x unified",
-    height=600
-)
-
-st.plotly_chart(fig_combined, use_container_width=True)
-
-# Update S_T for histogram (Ensure consistent distribution)
-S_T = simulate_gbm(current_price, time_to_maturity, risk_free_rate, volatility, n_sims)
-
-# Payoffs
-if option_type == "Call":
-    payoffs = np.maximum(S_T - strike_price, 0)
-else: # Put
-    payoffs = np.maximum(strike_price - S_T, 0)
-
-mc_price = np.exp(-risk_free_rate * time_to_maturity) * np.mean(payoffs)
-std_error = np.std(payoffs) / np.sqrt(n_sims) * np.exp(-risk_free_rate * time_to_maturity)
-
-
-# --- Distribution Histogram (Restored) ---
-st.subheader(f"Distribution of Terminal Prices (N={n_sims})")
-fig_hist = px.histogram(S_T, nbins=50, title="Probability Density of Future Prices")
-fig_hist.add_vline(x=strike_price, line_dash="dash", line_color="red", annotation_text="Strike")
-fig_hist.add_vline(x=current_price * np.exp(risk_free_rate * time_to_maturity), line_dash="dot", line_color="green", annotation_text="Exp. Value")
-
-fig_hist.update_layout(
-    xaxis_title="Price at Maturity",
-    yaxis_title="Frequency",
-    showlegend=False,
-    height=400
-)
-st.plotly_chart(fig_hist, use_container_width=True)
-
+# 2. DISTRIBUTION + VOL HEATMAP (Columns)
 st.markdown("---")
+dist_col, heat_col = st.columns(2)
 
-# --- Heatmap & Time Analysis ---
-st.header("📅 Time & Volatility Analysis (Heatmap)")
+with dist_col:
+    st.subheader("Terminal Price Distribution")
+    fig_hist = px.histogram(S_T, nbins=50, title=None)
+    fig_hist.add_vline(x=strike_price, line_dash="dash", line_color="red")
+    fig_hist.update_layout(xaxis_title="Price at Maturity", yaxis_title="Frequency", height=400, margin=dict(l=0, r=0, t=20, b=0))
+    st.plotly_chart(fig_hist, use_container_width=True)
 
-# Range of Spot Prices and Volatilities for Heatmap
-spot_range = np.linspace(default_spot * 0.8, default_spot * 1.2, 10)
-vol_range = np.linspace(0.1, 0.5, 10)
+with heat_col:
+    st.subheader("Price Sensitivity (Spot vs Vol)")
+    s_range = np.linspace(current_price * 0.8, current_price * 1.2, 10)
+    v_range = np.linspace(0.1, 0.6, 10)
+    z_prices = np.zeros((10, 10))
+    for i, s_tmp in enumerate(s_range):
+        for j, v_tmp in enumerate(v_range):
+            z_prices[j, i] = black_scholes_price(s_tmp, strike_price, time_to_maturity, risk_free_rate, v_tmp, option_type.lower())
+    fig_heat = go.Figure(data=go.Heatmap(z=z_prices, x=s_range, y=v_range, colorscale='Viridis', hovertemplate="Spot: $%{x:.2f}<br>Vol: %{y:.2f}<br>Price: $%{z:.2f}<extra></extra>"))
+    fig_heat.update_layout(xaxis_title="Spot Price", yaxis_title="Volatility", height=400, margin=dict(l=0, r=0, t=20, b=0))
+    st.plotly_chart(fig_heat, use_container_width=True)
 
-# Create 2D Matrix of Prices using Current Time T
-z_prices = np.zeros((10, 10))
-for i, s_tmp in enumerate(spot_range):
-    for j, v_tmp in enumerate(vol_range):
-        z_prices[j, i] = black_scholes_price(
-            s_tmp, strike_price, time_to_maturity, risk_free_rate, v_tmp, option_type.lower()
-        )
+# ============================================================================
+# ANALYSIS & DETAILS (Bottom)
+# ============================================================================
+st.markdown("---")
+detail_col1, detail_col2 = st.columns(2)
 
-fig_heatmap = go.Figure(data=go.Heatmap(
-    z=z_prices,
-    x=spot_range,
-    y=vol_range,
-    colorscale='Viridis',
-    hovertemplate="Spot: %{x:.2f}<br>Vol: %{y:.2f}<br>Price: $%{z:.2f}<extra></extra>"
-))
+with detail_col1:
+    with st.expander("Greeks & Sensitivities"):
+        if st.sidebar.button("Calculate Greeks") or True: # Auto-show if possible
+            greeks_params = {'jump_intensity': jump_intensity, 'jump_mean': jump_mean, 'jump_std': jump_std} if model_type == "Jump Diffusion (Crash Model)" else {}
+            model_name = 'jump_diffusion' if model_type == "Jump Diffusion (Crash Model)" else 'gbm'
+            greeks = calculate_all_greeks(current_price, strike_price, time_to_maturity, risk_free_rate, volatility, option_type.lower(), model=model_name, n_sims=5000, **greeks_params)
+            
+            g_col1, g_col2, g_col3 = st.columns(3)
+            g_col1.metric("Delta (Δ)", f"{greeks['delta']:.4f}")
+            g_col2.metric("Vega (ν)", f"{greeks['vega']:.4f}")
+            g_col3.metric("Gamma (Γ)", f"{greeks['gamma']:.6f}")
 
-fig_heatmap.update_layout(
-    title="Option Price Sensitivity (Spot Price vs. Volatility)",
-    xaxis_title="Spot Price ($)",
-    yaxis_title="Volatility ($\sigma$)",
-    height=500
-)
+with detail_col2:
+    if market_price > 0:
+        model_p = bs_price
+        diff = model_p - market_price
+        st.info(f"Signal: **{'BUY (Undervalued)' if diff > 0 else 'SELL (Overvalued)'}** (Diff: ${abs(diff):.2f})")
 
-# Recommendation Engine Logic
-st.plotly_chart(fig_heatmap, use_container_width=True)
+if model_type == "Jump Diffusion (Crash Model)":
+    with st.expander("Model Comparison Details"):
+        # Quick GBM recalc for comparison
+        S_T_gbm = simulate_gbm(current_price, time_to_maturity, risk_free_rate, volatility, n_sims)
+        pay_gbm = np.maximum(S_T_gbm - strike_price, 0) if option_type == "Call" else np.maximum(strike_price - S_T_gbm, 0)
+        mc_gbm = np.exp(-risk_free_rate * time_to_maturity) * np.mean(pay_gbm)
+        
+        comp_df = pd.DataFrame({
+            "Metric": ["MC Price", "Crash Premium", "95% VaR"],
+            "Standard GBM": [f"${mc_gbm:.4f}", "-", f"${np.percentile(S_T_gbm, 5):.2f}"],
+            "Jump Diffusion": [f"${mc_price:.4f}", f"${mc_price - mc_gbm:.4f}", f"${np.percentile(S_T, 5):.2f}"]
+        })
+        st.table(comp_df)
 
-st.markdown("### 🎓 Maturity Recommendation")
-rec_col_a, rec_col_b = st.columns(2)
-
-with rec_col_a:
-    st.info("**Strategy: Buying Options (Long)**")
-    st.markdown("""
-    *   **Recommendation:** Prefer **Longer Maturity (> 45 Days)**.
-    *   **Reason:** Time decay (Theta) accelerates as you get closer to expiration. Buying more time reduces the daily loss in value, giving your trade more time to work.
-    """)
-
-with rec_col_b:
-    st.warning("**Strategy: Selling Options (Short)**")
-    st.markdown("""
-    *   **Recommendation:** Prefer **Shorter Maturity (< 30 Days)**.
-    *   **Reason:** You *want* the option to lose value quickly. Time decay is your friend here, accelerating rapidly in the final month.
-    """)
-
-# Interactive Decay Plot
-st.subheader("📉 Time Decay Visualization (Theta)")
-days_to_expiry = np.linspace(0.01, 2.0, 50) # From 2 years down to 0
-decay_prices = []
-
-for t_val in days_to_expiry:
-    decay_prices.append(
-        black_scholes_price(current_price, strike_price, t_val, risk_free_rate, volatility, option_type.lower())
-    )
-
-fig_decay = go.Figure()
-fig_decay.add_trace(go.Scatter(x=days_to_expiry, y=decay_prices, mode='lines', name='Option Price'))
-fig_decay.update_layout(
-    title=f"Theoretical Price vs. Time to Maturity (Holding Other Factors Constant)",
-    xaxis_title="Time to Maturity (Years)",
-    yaxis_title="Theoretical Option Price ($)",
-    xaxis=dict(autorange="reversed") # Standard convention: Time moves right to left (2 yrs -> 0)
-)
-st.plotly_chart(fig_decay, use_container_width=True)
+st.success("Dashboard Ready")
