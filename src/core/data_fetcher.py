@@ -10,6 +10,7 @@ import yfinance as yf
 import numpy as np
 import pandas as pd
 from datetime import datetime
+import asyncio
 
 
 def get_spot_and_vol(ticker_symbol):
@@ -17,7 +18,7 @@ def get_spot_and_vol(ticker_symbol):
     Fetches the current spot price and historical volatility for a ticker.
 
     Inputs:
-        ticker_symbol: Yahoo Finance ticker string (e.g., 'SPY')
+        ticker_symbol: Yahoo Finance ticker string (e.g., '^SPX' for S&P 500 index)
 
     Output:
         dict with keys: 'spot', 'historical_vol', 'name'
@@ -65,15 +66,33 @@ def get_risk_free_rate():
     return 0.05  # Default fallback
 
 
-def get_options_chain(ticker_symbol, max_expirations=3, target_days=None):
+def get_available_expirations(ticker_symbol):
+    """
+    Fetches the list of all available options expiration dates for a ticker.
+    
+    Inputs:
+        ticker_symbol: Yahoo Finance ticker string (e.g., '^SPX' for S&P 500 index)
+        
+    Output:
+        list of str in 'YYYY-MM-DD' format, or empty list if failed.
+    """
+    try:
+        tk = yf.Ticker(ticker_symbol)
+        return list(tk.options)
+    except Exception:
+        return []
+
+def get_options_chain(ticker_symbol, max_expirations=3, target_days=None, specific_expirations=None):
     """
     Fetches the live options chain for a ticker from Yahoo Finance.
 
     Inputs:
-        ticker_symbol: Yahoo Finance ticker string (e.g., 'SPY')
+        ticker_symbol: Yahoo Finance ticker string (e.g., '^SPX' for S&P 500 index)
         max_expirations: Maximum number of expiration dates to fetch (int)
         target_days: If provided, ignores max_expirations and finds the one 
                      expiration date closest to this number of days (int).
+        specific_expirations: Optional list of specific 'YYYY-MM-DD' strings to fetch. 
+                              If provided, overrides max_expirations and target_days.
 
     Output:
         pd.DataFrame with columns:
@@ -97,7 +116,10 @@ def get_options_chain(ticker_symbol, max_expirations=3, target_days=None):
         if not expirations:
             return pd.DataFrame()
 
-        if target_days is not None:
+        if specific_expirations:
+            # Only keep requested expirations that actually exist
+            selected = [d for d in specific_expirations if d in expirations]
+        elif target_days is not None:
             # Find the expiration date closest to target_days
             today = datetime.now()
             days_list = []
@@ -110,7 +132,7 @@ def get_options_chain(ticker_symbol, max_expirations=3, target_days=None):
             selected = [sorted(days_list)[0][1]]
         else:
             # Take the nearest N expirations (Existing logic)
-            selected = expirations[:max_expirations]
+            selected = list(expirations)[:max_expirations]
 
         all_rows = []
         today = datetime.now()
@@ -184,3 +206,12 @@ def get_options_chain(ticker_symbol, max_expirations=3, target_days=None):
     except Exception as e:
         print(f"Error fetching options chain: {e}")
         return pd.DataFrame()
+
+
+async def get_options_chain_async(ticker_symbol, max_expirations=3):
+    """
+    Asynchronously fetches live options chain using `asyncio.to_thread` wrapped around `yfinance`.
+    This prevents blocking the FastAPI event loop while still utilizing yfinance's robust Cookie/Crumb 
+    handling to prevent Yahoo Finance 429 Rate Limit blocks.
+    """
+    return await asyncio.to_thread(get_options_chain, ticker_symbol, max_expirations)

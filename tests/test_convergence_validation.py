@@ -14,8 +14,8 @@ class TestConvergenceValidation(unittest.TestCase):
     
     def test_statistical_convergence(self):
         """
-        Step 2: Statistical Convergence Test
-        Assert that Monte Carlo price is within 3 Standard Errors of Black-Scholes price.
+        Assert that the Monte Carlo price is within 3 standard errors of
+        the Black-Scholes price.
         """
         S0 = 100.0
         K = 100.0
@@ -24,10 +24,10 @@ class TestConvergenceValidation(unittest.TestCase):
         sigma = 0.2
         n_sims = 100000  # High number of paths for accuracy
         
-        # 1. Black-Scholes Price
+        # Black-Scholes price
         bs_price = black_scholes_price(S0, K, T, r, sigma, option_type='call')
         
-        # 2. Monte Carlo Price
+        # Monte Carlo price
         S_T = simulate_gbm(S0, T, r, sigma, n_sims)
         payoffs = np.maximum(S_T - K, 0)
         mc_price = np.exp(-r * T) * np.mean(payoffs)
@@ -42,7 +42,7 @@ class TestConvergenceValidation(unittest.TestCase):
         print(f"Difference: {abs(mc_price - bs_price):.4f}")
         print(f"Z-Score: {abs(mc_price - bs_price) / std_error:.4f}")
         
-        # 3. Statistical Assertion (3 Sigma Rule)
+        # Statistical assertion
         self.assertTrue(
             abs(mc_price - bs_price) < 3 * std_error,
             f"MC Price {mc_price:.4f} is NOT within 3 Standard Errors of BS Price {bs_price:.4f}"
@@ -50,7 +50,7 @@ class TestConvergenceValidation(unittest.TestCase):
 
     def test_edge_cases(self):
         """
-        Step 4: Edge Case Stress Test
+        Stress test for edge cases.
         """
         print(f"\n--- Edge Case Test ---")
         

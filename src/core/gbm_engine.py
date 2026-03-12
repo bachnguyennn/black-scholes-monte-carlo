@@ -9,10 +9,18 @@ where Z ~ N(0, 1)
 
 import numpy as np
 
-def simulate_gbm(S0, T, r, sigma, n_sims):
+try:
+    from numba import njit
+except ImportError:
+    def njit(*args, **kwargs):
+        def decorator(func):
+            return func
+        return decorator
+
+@njit(fastmath=True)
+def simulate_gbm(S0, T, r, sigma, n_sims, seed=-1):
     """
     Simulates terminal asset prices using Geometric Brownian Motion.
-    
     
     Inputs:
         S0: Initial price (float)
@@ -20,20 +28,19 @@ def simulate_gbm(S0, T, r, sigma, n_sims):
         r: Risk-free rate (float)
         sigma: Volatility (float)
         n_sims: Number of simulations (int)
+        seed: Random seed for reproducibility (int, default -1 for None)
         
     Output:
         S_T: NumPy array of shape (n_sims,) representing terminal prices
     """
-    if T <= 0:
-        raise ValueError("Time to maturity (T) must be positive.")
-    if sigma <= 0:
-        raise ValueError("Volatility (sigma) must be positive.")
-
-    # Generate random standard normals Z ~ N(0, 1)
-    Z = np.random.standard_normal(n_sims)
+    if seed != -1:
+        np.random.seed(seed)
     
     # Calculate terminal prices directly using the exact solution
     # S_T = S_0 * exp( (r - 0.5*sigma^2)*T + sigma*sqrt(T)*Z )
+    
+    # Generate random standard normals Z ~ N(0, 1)
+    Z = np.random.randn(n_sims)
     
     drift = (r - 0.5 * sigma**2) * T
     diffusion = sigma * np.sqrt(T) * Z
@@ -42,7 +49,7 @@ def simulate_gbm(S0, T, r, sigma, n_sims):
     
     return S_T
 
-def simulate_gbm_paths(S0, T, r, sigma, n_paths, n_steps=100):
+def simulate_gbm_paths(S0, T, r, sigma, n_paths, n_steps=100, seed=None):
     """
     Simulates full price paths using Geometric Brownian Motion.
      useful for visualization.
@@ -54,10 +61,12 @@ def simulate_gbm_paths(S0, T, r, sigma, n_paths, n_steps=100):
         sigma: Volatility (float)
         n_paths: Number of simulation paths (int)
         n_steps: Number of time steps (int)
+        seed: Random seed for reproducibility (int, optional)
         
     Output:
         paths: NumPy array of shape (n_paths, n_steps + 1)
     """
+    rng = np.random.default_rng(seed)
     if T <= 0:
         raise ValueError("Time to maturity (T) must be positive.")
     if sigma <= 0:
@@ -65,7 +74,7 @@ def simulate_gbm_paths(S0, T, r, sigma, n_paths, n_steps=100):
 
     dt = T / n_steps
     # Z ~ N(0, 1)
-    Z = np.random.standard_normal((n_paths, n_steps))
+    Z = rng.standard_normal((n_paths, n_steps))
     
     drift = (r - 0.5 * sigma**2) * dt
     diffusion = sigma * np.sqrt(dt) * Z

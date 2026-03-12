@@ -9,8 +9,53 @@ so we use numerical approximation via finite differences.
 """
 
 import numpy as np
+from scipy.stats import norm
+
+try:
+    import jax
+    import jax.numpy as jnp
+    from jax.scipy.stats import norm as jax_norm
+    JAX_AVAILABLE = True
+except ImportError:
+    jax = None
+    jnp = None
+    jax_norm = None
+    JAX_AVAILABLE = False
+
 from .jump_diffusion import simulate_jump_diffusion
 from .gbm_engine import simulate_gbm
+
+if JAX_AVAILABLE:
+    @jax.jit
+    def bs_price_jax(S, K, T, r, sigma, is_call=True):
+        """
+        JAX-compatible Black-Scholes pricing formula.
+        Used exclusively for Automatic Differentiation to get exact, noise-free Greeks.
+        """
+        d1 = (jnp.log(S / K) + (r + 0.5 * sigma**2) * T) / (sigma * jnp.sqrt(T))
+        d2 = d1 - sigma * jnp.sqrt(T)
+
+        call_price = S * jax_norm.cdf(d1) - K * jnp.exp(-r * T) * jax_norm.cdf(d2)
+        put_price = K * jnp.exp(-r * T) * jax_norm.cdf(-d2) - S * jax_norm.cdf(-d1)
+
+        return jnp.where(is_call, call_price, put_price)
+
+    _jax_delta = jax.jit(jax.grad(bs_price_jax, argnums=0))
+    _jax_vega = jax.jit(jax.grad(bs_price_jax, argnums=4))
+    _jax_gamma = jax.jit(jax.grad(jax.grad(bs_price_jax, argnums=0), argnums=0))
+else:
+    bs_price_jax = None
+    _jax_delta = None
+    _jax_vega = None
+    _jax_gamma = None
+
+
+def _bs_d1_d2(S0, K, T, r, sigma):
+    sqrt_T = np.sqrt(T)
+    d1 = (np.log(S0 / K) + (r + 0.5 * sigma**2) * T) / (sigma * sqrt_T)
+    d2 = d1 - sigma * sqrt_T
+    return d1, d2, sqrt_T
+
 
 
 def price_option(S0, K, T, r, sigma, option_type='call', model='gbm', n_sims=50000, **kwargs):
@@ -56,125 +101,45 @@ def price_option(S0, K, T, r, sigma, option_type='call', model='gbm', n_sims=500
 def calculate_delta(S0, K, T, r, sigma, option_type='call', 
                     model='gbm', h=0.01, n_sims=50000, **kwargs):
     """
-    Calculate Delta using central finite difference method.
-    
-    Delta measures the rate of change of option price with respect to 
-    the underlying asset price.
-    
-    Formula: Δ = (V(S+h) - V(S-h)) / (2h)
-    
-    Inputs:
-        S0: Current asset price (float)
-        K: Strike price (float)
-        T: Time to maturity (float)
-        r: Risk-free rate (float)
-        sigma: Volatility (float)
-        option_type: 'call' or 'put' (str)
-        model: 'gbm' or 'jump_diffusion' (str)
-        h: Step size for finite difference (float, default 0.01 = 1%)
-        n_sims: Number of simulations (int)
-        **kwargs: Additional parameters for jump_diffusion model
-        
-    Output:
-        delta: Delta value (float)
-        
-    Interpretation:
-        - For calls: 0 < Δ < 1 (typically 0.5 for ATM)
-        - For puts: -1 < Δ < 0 (typically -0.5 for ATM)
-        - Δ = 0.7 means option price increases by $0.70 for $1 stock increase
+    Calculate Delta using JAX Automatic Differentiation (exact Black-Scholes equivalent).
     """
-    # Price at S0 + h
-    V_up = price_option(S0 * (1 + h), K, T, r, sigma, option_type, model, n_sims, **kwargs)
-    
-    # Price at S0 - h
-    V_down = price_option(S0 * (1 - h), K, T, r, sigma, option_type, model, n_sims, **kwargs)
-    
-    # Central difference
-    delta = (V_up - V_down) / (2 * S0 * h)
-    
-    return delta
+    is_call = option_type.lower() == 'call'
+    if JAX_AVAILABLE:
+        return float(_jax_delta(S0, K, T, r, sigma, is_call))
+
+    d1, _, _ = _bs_d1_d2(S0, K, T, r, sigma)
+    if is_call:
+        return float(norm.cdf(d1))
+    return float(norm.cdf(d1) - 1.0)
 
 
 def calculate_vega(S0, K, T, r, sigma, option_type='call',
                    model='gbm', h=0.01, n_sims=50000, **kwargs):
     """
-    Calculate Vega using central finite difference method.
-    
-    Vega measures the rate of change of option price with respect to volatility.
-    
-    Formula: ν = (V(σ+h) - V(σ-h)) / (2h)
-    
-    Inputs:
-        S0: Current asset price (float)
-        K: Strike price (float)
-        T: Time to maturity (float)
-        r: Risk-free rate (float)
-        sigma: Volatility (float)
-        option_type: 'call' or 'put' (str)
-        model: 'gbm' or 'jump_diffusion' (str)
-        h: Step size for finite difference (float, default 0.01 = 1%)
-        n_sims: Number of simulations (int)
-        **kwargs: Additional parameters for jump_diffusion model
-        
-    Output:
-        vega: Vega value (float)
-        
-    Interpretation:
-        - Vega is always positive for both calls and puts
-        - Higher for ATM options, lower for deep ITM/OTM
-        - Vega = 0.25 means option price increases by $0.25 for 1% vol increase
+    Calculate Vega using JAX Automatic Differentiation.
+    Returns the sensitivity to a 1 point (100%) change in vol. 
+    Traditionally reported as value change per 1% vol change.
     """
-    # Price at σ + h
-    V_up = price_option(S0, K, T, r, sigma * (1 + h), option_type, model, n_sims, **kwargs)
-    
-    # Price at σ - h
-    V_down = price_option(S0, K, T, r, sigma * (1 - h), option_type, model, n_sims, **kwargs)
-    
-    # Central difference (divide by sigma*h to get per-unit change)
-    vega = (V_up - V_down) / (2 * sigma * h)
-    
-    return vega
+    is_call = option_type.lower() == 'call'
+    if JAX_AVAILABLE:
+        raw_vega = float(_jax_vega(S0, K, T, r, sigma, is_call))
+    else:
+        d1, _, sqrt_T = _bs_d1_d2(S0, K, T, r, sigma)
+        raw_vega = float(S0 * norm.pdf(d1) * sqrt_T)
+    return raw_vega / 100.0
 
 
 def calculate_gamma(S0, K, T, r, sigma, option_type='call',
                     model='gbm', h=0.01, n_sims=50000, **kwargs):
     """
-    Calculate Gamma using central finite difference method.
-    
-    Gamma measures the rate of change of Delta with respect to the underlying price.
-    It represents the curvature of the option price curve.
-    
-    Formula: Γ = (V(S+h) - 2V(S) + V(S-h)) / h²
-    
-    Inputs:
-        S0: Current asset price (float)
-        K: Strike price (float)
-        T: Time to maturity (float)
-        r: Risk-free rate (float)
-        sigma: Volatility (float)
-        option_type: 'call' or 'put' (str)
-        model: 'gbm' or 'jump_diffusion' (str)
-        h: Step size for finite difference (float, default 0.01 = 1%)
-        n_sims: Number of simulations (int)
-        **kwargs: Additional parameters for jump_diffusion model
-        
-    Output:
-        gamma: Gamma value (float)
-        
-    Interpretation:
-        - Gamma is always positive for both calls and puts
-        - Highest for ATM options near expiration
-        - Measures how fast Delta changes as stock price moves
+    Calculate Gamma using JAX Automatic Differentiation (Second derivative w.r.t S).
     """
-    # Price at three points
-    V_up = price_option(S0 * (1 + h), K, T, r, sigma, option_type, model, n_sims, **kwargs)
-    V_mid = price_option(S0, K, T, r, sigma, option_type, model, n_sims, **kwargs)
-    V_down = price_option(S0 * (1 - h), K, T, r, sigma, option_type, model, n_sims, **kwargs)
-    
-    # Second derivative
-    gamma = (V_up - 2 * V_mid + V_down) / ((S0 * h) ** 2)
-    
-    return gamma
+    is_call = option_type.lower() == 'call'
+    if JAX_AVAILABLE:
+        return float(_jax_gamma(S0, K, T, r, sigma, is_call))
+
+    d1, _, sqrt_T = _bs_d1_d2(S0, K, T, r, sigma)
+    return float(norm.pdf(d1) / (S0 * sigma * sqrt_T))
 
 
 def calculate_all_greeks(S0, K, T, r, sigma, option_type='call',
