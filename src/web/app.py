@@ -4,19 +4,18 @@ app.py
 Architecture:
     src/web/tabs/
         tab_option_analysis.py  — Tab 1: Single option pricing & path simulation
-        tab_scanner.py          — Tab 2: Live arbitrage scanner (async FastAPI)
+        tab_scanner.py          — Tab 2: Live valuation gap scanner (async FastAPI)
         tab_backtester.py       — Tab 3: Historical backtest (Heston / Jump Diffusion)
         tab_portfolio_risk.py   — Tab 4: 3D Gamma/Vanna/Vega vectorized surfaces
 """
 
 import streamlit as st
-import numpy as np
 import sys
 import os
-import yfinance as yf
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
 
+from src.core.data_fetcher import get_market_data_runtime_summary, get_spot_and_vol
 from src.core.heston_model import feller_condition
 from src.web.tabs import tab_option_analysis, tab_scanner, tab_backtester, tab_portfolio_risk
 
@@ -78,30 +77,36 @@ if ticker.upper() in {"SPY", "IVV", "VOO"}:
 elif ticker.upper() in {"^SPX", "SPX"}:
     st.sidebar.success("Using S&P 500 index exposure. This is the best fit for a European-style workflow in the current app.")
 
+market_data_summary = get_market_data_runtime_summary()
+st.sidebar.caption(f"Market data preference: `{market_data_summary['provider_preference']}`")
+st.sidebar.caption(market_data_summary["note"])
+if market_data_summary["provider_preference"] != "yfinance":
+    st.sidebar.caption(
+        "Options chains still use yfinance in this app because Polygon free/basic is only integrated for supported REST workflows."
+    )
+
 
 @st.cache_data(ttl=3600)
 def fetch_asset_data(symbol):
-    try:
-        asset = yf.Ticker(symbol)
-        history = asset.history(period="1y")
-        if history.empty:
-            return None
-        log_returns = np.log(history['Close'] / history['Close'].shift(1))
-        vol = float(log_returns.std() * np.sqrt(252))
-        return {
-            'price': float(history['Close'].iloc[-1]),
-            'vol': min(max(vol, 0.05), 1.0),
-            'history': history['Close'],
-            'name': asset.info.get('longName', symbol)
-        }
-    except Exception:
+    spot_data = get_spot_and_vol(symbol)
+    if not spot_data:
         return None
+    return {
+        'price': float(spot_data['spot']),
+        'vol': min(max(float(spot_data['historical_vol']), 0.05), 1.0),
+        'history': spot_data['history'],
+        'name': spot_data['name'],
+        'provider': spot_data.get('provider', 'yfinance'),
+        'provider_note': spot_data.get('provider_note', ''),
+    }
 
 
 asset_data = fetch_asset_data(ticker)
 
 if asset_data:
-    st.sidebar.success(f"Loaded: {asset_data['name']}")
+    st.sidebar.success(f"Loaded: {asset_data['name']} ({asset_data.get('provider', 'yfinance')})")
+    if asset_data.get('provider_note'):
+        st.sidebar.caption(asset_data['provider_note'])
     default_spot = asset_data['price']
     default_vol = asset_data['vol']
 else:
@@ -235,7 +240,7 @@ n_sims = st.sidebar.number_input("Simulations (N)", min_value=1000, max_value=10
 # ============================================================================
 
 tab1, tab2, tab3, tab4 = st.tabs([
-    "Option Pricing", "Live Scanner", "Backtester", "Risk Surfaces"
+    "Option Pricing", "Valuation Scanner", "Backtester", "Risk Surfaces"
 ])
 
 with tab1:

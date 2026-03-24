@@ -1,7 +1,7 @@
 """
 tab_scanner.py
 
-Tab 2 - Live Arbitrage Scanner
+Tab 2 - Live Valuation Gap Scanner
 Handles the live options chain fetch, async API call to FastAPI backend,
 fallback local scan, diagnostics, and results display.
 """
@@ -13,8 +13,14 @@ import requests
 import os
 from datetime import datetime
 
-from src.core.data_fetcher import get_options_chain, get_spot_and_vol, get_risk_free_rate, get_available_expirations
-from src.core.scanner_engine import scan_for_arbitrage
+from src.core.data_fetcher import (
+    get_available_expirations,
+    get_market_data_runtime_summary,
+    get_options_chain,
+    get_risk_free_rate,
+    get_spot_and_vol,
+)
+from src.core.scanner_engine import scan_for_valuation_gaps
 from src.core.calibration_engine import calibrate_heston, calibrate_lsv
 
 
@@ -23,6 +29,16 @@ SCAN_API_URL = os.getenv("QUANT_TERMINAL_SCAN_API_URL", "http://127.0.0.1:8000/s
 @st.cache_data(ttl=300)
 def fetch_available_expirations(ticker):
     return get_available_expirations(ticker)
+
+
+@st.cache_data(ttl=120)
+def fetch_spot_data(ticker):
+    return get_spot_and_vol(ticker)
+
+
+@st.cache_data(ttl=300)
+def fetch_risk_free_rate():
+    return get_risk_free_rate()
 
 
 def _style_signal(val):
@@ -67,7 +83,7 @@ def _run_local_scan(options_df, S0, r_live, scan_model, scanner_sims, default_vo
                     jump_intensity, jump_mean, jump_std,
                     heston_V0, heston_kappa, heston_theta, heston_xi, heston_rho,
                     lsv_leverage, lsv_strikes, lsv_mats, engine_label):
-    results_df, scan_diagnostics = scan_for_arbitrage(
+    results_df, scan_diagnostics = scan_for_valuation_gaps(
         options_df, S0, r_live, model=scan_model,
         leverage_matrix=lsv_leverage,
         leverage_strikes=lsv_strikes,
@@ -96,10 +112,13 @@ def _extract_api_detail(response):
 def render(ticker, model_type, default_vol, n_sims,
            jump_intensity, jump_mean, jump_std,
            heston_V0, heston_kappa, heston_theta, heston_xi, heston_rho):
-    """Renders the full Live Arbitrage Scanner tab."""
+    """Renders the full valuation-gap scanner tab."""
 
-    st.subheader(f"Live Options Scanner: {ticker}")
-    st.caption("Signals include data-quality diagnostics so you can explain what was filtered, how volatility was sourced, and which engine produced the prices.")
+    st.subheader(f"Live Valuation Gap Scanner: {ticker}")
+    st.caption("Signals rank model-versus-market valuation gaps and include data-quality diagnostics so you can explain what was filtered, how volatility was sourced, and which engine produced the prices.")
+    market_data_summary = get_market_data_runtime_summary()
+    if market_data_summary["provider_preference"] != "yfinance":
+        st.info(market_data_summary["options_chain_note"])
 
     scan_col1, scan_col2, scan_col3 = st.columns([2, 2, 1])
     with scan_col1:
@@ -131,8 +150,8 @@ def render(ticker, model_type, default_vol, n_sims,
 
     with scan_col3:
         st.markdown("**Scan Actions**")
-        scan_button = st.button("Scan Market", type="primary", use_container_width=True,
-            help="Run the pricing engine to find mispriced options in the selected expirations.")
+        scan_button = st.button("Run Scan", type="primary", use_container_width=True,
+            help="Run the pricing engine to rank valuation gaps across the selected expirations.")
 
     if not selected_exps:
         st.warning(f"Please select at least one expiration date to scan {ticker}.")
@@ -141,8 +160,8 @@ def render(ticker, model_type, default_vol, n_sims,
     # --- Calibration Section ---
     with st.expander("Advanced: Calibrate Models to Market (Optional)", expanded=False):
         st.markdown("""
-        Calibration fits model parameters to today's live market prices, improving scan accuracy.
-        Run these steps in order before clicking **Scan Market**.
+        Calibration fits model parameters to today's live market prices, improving valuation-gap estimates.
+        Run these steps in order before clicking **Run Scan**.
         """)
         cal_col1, cal_col2 = st.columns(2)
         with cal_col1:
@@ -152,17 +171,19 @@ def render(ticker, model_type, default_vol, n_sims,
                 help="Fits the Heston stochastic-vol parameters to today's market implied volatility surface.")
         with cal_col2:
             st.markdown("**LSV Calibration**")
-            st.caption("Builds a Leverage Function on top of Heston to perfectly match every market price.")
+            st.caption("Builds a leverage function on top of Heston to better match the observed market surface.")
             lsv_calibrate_button = st.button("Calibrate LSV Leverage Function", use_container_width=True,
                 help="Derives the non-parametric leverage function L(S,t) from the market surface. Requires Heston calibration first.")
 
     # --- Execute Calibration ---
     if calibrate_button:
         with st.spinner(f"Calibrating Heston to market surface for {ticker}..."):
-            r_live = get_risk_free_rate()
-            spot_data = get_spot_and_vol(ticker)
+            r_live = fetch_risk_free_rate()
+            spot_data = fetch_spot_data(ticker)
             options_df = get_options_chain(ticker, specific_expirations=selected_exps)
-            if not options_df.empty:
+            if spot_data is None:
+                st.error(f"Could not fetch spot data for {ticker}.")
+            elif not options_df.empty:
                 calib_res = calibrate_heston(options_df, spot_data['spot'], r_live)
                 if calib_res['success']:
                     st.success(f"Heston calibrated. {calib_res['message']}")
@@ -180,11 +201,13 @@ def render(ticker, model_type, default_vol, n_sims,
     # --- LSV Calibration ---
     if lsv_calibrate_button:
         with st.spinner(f"Calibrating LSV model for {ticker}..."):
-            r_live = get_risk_free_rate()
-            spot_data = get_spot_and_vol(ticker)
+            r_live = fetch_risk_free_rate()
+            spot_data = fetch_spot_data(ticker)
             options_df = get_options_chain(ticker, specific_expirations=selected_exps)
 
-            if not options_df.empty:
+            if spot_data is None:
+                st.error(f"Could not fetch spot data for {ticker}.")
+            elif not options_df.empty:
                 # Get current Heston params or use defaults
                 heston_params = {
                     'kappa': st.session_state.get('heston_kappa', heston_kappa),
@@ -207,7 +230,7 @@ def render(ticker, model_type, default_vol, n_sims,
                     st.session_state['lsv_leverage_matrix'] = lsv_res['leverage_matrix']
                     st.session_state['lsv_strikes'] = lsv_res['strikes_grid']
                     st.session_state['lsv_maturities'] = lsv_res['maturities_grid']
-                    st.info("LSV parameters loaded. Select model 'Heston' and click 'Scan Market' to use the calibrated leverage function.")
+                    st.info("LSV parameters loaded. Select model 'Heston' and click 'Run Scan' to use the calibrated leverage function.")
                 else:
                     st.error(f"{lsv_res.get('message', 'Unknown error')}")
             else:
@@ -218,8 +241,8 @@ def render(ticker, model_type, default_vol, n_sims,
     # --- Scan ---
     if scan_button:
         with st.spinner(f"Fetching options chain for {ticker}..."):
-            spot_data = get_spot_and_vol(ticker)
-            r_live = get_risk_free_rate()
+            spot_data = fetch_spot_data(ticker)
+            r_live = fetch_risk_free_rate()
             options_df = get_options_chain(ticker, specific_expirations=selected_exps)
 
         if spot_data is None:
@@ -407,7 +430,7 @@ def render(ticker, model_type, default_vol, n_sims,
             filtered_df = filtered_df[filtered_df['T_days'] >= min_dte]
 
         # Show filter summary
-        st.caption(f"Showing {len(filtered_df)} of {len(results_df)} opportunities | Filtered: {len(results_df) - len(filtered_df)}")
+        st.caption(f"Showing {len(filtered_df)} of {len(results_df)} valuation gaps | Filtered: {len(results_df) - len(filtered_df)}")
 
         st.markdown("---")
 
@@ -470,7 +493,7 @@ def render(ticker, model_type, default_vol, n_sims,
             st.dataframe(detailed_styled, width='stretch', hide_index=True)
 
         st.markdown("---")
-        st.subheader("Top Opportunities")
+        st.subheader("Top Valuation Gaps")
         top_n = min(10, len(filtered_df))
         if top_n > 0:
             topN = filtered_df.head(top_n).copy()
@@ -484,11 +507,11 @@ def render(ticker, model_type, default_vol, n_sims,
         st.plotly_chart(fig_bar, width='stretch')
 
     else:
-        st.info("Click **SCAN MARKET** to find mispriced options.")
+        st.info("Click **RUN SCAN** to rank model-versus-market valuation gaps.")
         st.markdown("""
         | Signal | Meaning |
         |--------|---------|
-        | [ BUY ] | MC Fair Value > Market Ask (undervalued after crossing spread) |
-        | [ SELL ] | MC Fair Value < Market Bid (overvalued after crossing spread) |
+        | [ BUY ] | MC Fair Value > Market Ask (positive buy-side valuation gap after crossing spread) |
+        | [ SELL ] | MC Fair Value < Market Bid (positive sell-side valuation gap after crossing spread) |
         | [ HOLD ] | No actionable edge after accounting for bid-ask spread |
         """)

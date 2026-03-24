@@ -232,14 +232,14 @@ The backtester’s delta-hedging logic matters because it attempts to separate v
 
 ## 9. Scanner Logic And Execution Realism
 
-The scanner does not compare model value to the midpoint and call it an opportunity. It uses bid/ask-aware logic:
+The scanner does not compare model value to the midpoint and call it a tradable opportunity. It uses bid/ask-aware logic:
 
 - buy case: model value must exceed ask-side execution cost
 - sell case: model value must be below bid-side execution proceeds
 
 ### Why it matters
 
-This improves realism because live trading must cross the spread. Midpoint-only arbitrage detection creates fake edges.
+This improves realism because live trading must cross the spread. Midpoint-only discrepancy detection creates fake edges.
 
 ### Additional diagnostic impact
 

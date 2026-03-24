@@ -1,5 +1,5 @@
 """
-config.py — Quant Terminal V2: Centralized Configuration
+config.py — Quant Research Terminal V2: Centralized Configuration
 
 Single source of truth for all tuneable constants, risk thresholds, and
 model assumptions. No magic numbers should appear inline in any module.

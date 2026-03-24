@@ -33,7 +33,7 @@ def render(ticker, option_type, n_sims,
 
         **Key Parameters**:
         - **Edge Threshold**: Minimum % difference between model fair value and market price to trigger trade entry
-        - **Term Structure**: Target option expirations (Days To Expiry) to scan for opportunities
+        - **Term Structure**: Target option expirations (Days To Expiry) to scan for candidate valuation gaps
         - **Model**: Choose between Heston (stochastic volatility) or Jump Diffusion (crash events)
         """)
 

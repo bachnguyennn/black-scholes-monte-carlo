@@ -19,7 +19,7 @@ import streamlit as st
 import numpy as np
 import plotly.graph_objects as go
 from scipy.interpolate import griddata
-from src.core.data_fetcher import get_options_chain
+from src.core.data_fetcher import get_market_data_runtime_summary, get_options_chain
 
 
 @st.cache_data(ttl=300)  # Cache for 5 minutes
@@ -108,6 +108,9 @@ def render(ticker, default_spot):
     else:
         # --- Market IV Surface Mode ---
         st.markdown("Visualizing the live Market Implied Volatility surface across Strike and Maturity.")
+        market_data_summary = get_market_data_runtime_summary()
+        if market_data_summary["provider_preference"] != "yfinance":
+            st.info(market_data_summary["options_chain_note"])
 
         # Add refresh control
         refresh_col1, refresh_col2 = st.columns([3, 1])
@@ -210,4 +213,3 @@ def render(ticker, default_spot):
             c3.metric("Strike Range", f"${strikes.min():.0f} - ${strikes.max():.0f}")
 
             st.info("This surface is derived from live market prices. The 'Smile' is visible across Strikes, while 'Term Structure' is visible across Time. Data is cached for 5 minutes — use the Refresh Data button for the latest prices.")
-

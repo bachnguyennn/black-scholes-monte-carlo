@@ -62,7 +62,7 @@ FastAPI entry point.
 Responsibilities:
 
 - receive structured scan requests from the frontend
-- run `scan_for_arbitrage`
+- run `scan_for_valuation_gaps`
 - return result rows plus diagnostics metadata
 
 ## Core Quant Layer
@@ -104,7 +104,7 @@ Responsibilities:
 
 ### [src/core/scanner_engine.py](src/core/scanner_engine.py)
 
-Live option-chain scanner.
+Live valuation-gap scanner over an option chain.
 
 Responsibilities:
 
@@ -213,14 +213,14 @@ Performance benchmark script for JIT-enabled simulation paths.
 
 ## Runtime Flow
 
-### Live scanner flow
+### Valuation scanner flow
 
 ```text
 Streamlit tab_scanner
     -> data_fetcher gets spot/expirations/chain
     -> optional calibration_engine workflow
     -> FastAPI /scan or local scanner_engine fallback
-    -> scanner_engine routes model and returns results + diagnostics
+    -> scanner_engine routes model and returns valuation-gap results + diagnostics
     -> Streamlit renders metrics, diagnostics, tables, and charts
 ```
 

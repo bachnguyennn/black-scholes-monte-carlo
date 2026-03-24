@@ -1,7 +1,8 @@
 """
 scanner_engine.py
 
-Batch pricing engine for scanning an entire options chain.
+Batch pricing engine for scanning an entire options chain for
+model-versus-market valuation gaps.
 Calculates theoretical fair values, applies quote-quality filters,
 and can optionally return structured diagnostics.
 """
@@ -96,20 +97,21 @@ def price_single_option_mc(S0, K, T, r, sigma, option_type, n_sims=10000,
     }
 
 
-def scan_for_arbitrage(options_df, S0, r, q=0.0,
-                       model='heston',
-                       n_sims=10000,
-                       leverage_matrix=None,
-                       leverage_strikes=None,
-                       leverage_maturities=None,
-                       jump_intensity=0.1, jump_mean=-0.05, jump_std=0.03,
-                       heston_V0=0.04, heston_kappa=2.0, heston_theta=0.04,
-                       heston_xi=0.3, heston_rho=-0.7,
-                       sigma_fallback=0.2,
-                       max_spread_pct=0.25,
-                       return_diagnostics=False):
+def scan_for_valuation_gaps(options_df, S0, r, q=0.0,
+                            model='heston',
+                            n_sims=10000,
+                            leverage_matrix=None,
+                            leverage_strikes=None,
+                            leverage_maturities=None,
+                            jump_intensity=0.1, jump_mean=-0.05, jump_std=0.03,
+                            heston_V0=0.04, heston_kappa=2.0, heston_theta=0.04,
+                            heston_xi=0.3, heston_rho=-0.7,
+                            sigma_fallback=0.2,
+                            max_spread_pct=0.25,
+                            return_diagnostics=False):
     """
-    Scans an entire options chain DataFrame for arbitrage opportunities.
+    Scans an entire options chain DataFrame for model-versus-market
+    valuation gaps.
 
     Uses realistic Bid-Ask spread logic instead of midpoint comparison:
         - BUY signal: mc_price > ask (you must pay the ask to buy)
@@ -324,7 +326,7 @@ def scan_for_arbitrage(options_df, S0, r, q=0.0,
 
     result_df = pd.DataFrame(results)
 
-    # Sort by absolute edge percentage (biggest opportunities first)
+    # Sort by absolute edge percentage (largest valuation gaps first)
     result_df['abs_edge_pct'] = result_df['edge_pct'].abs()
     result_df = result_df.sort_values('abs_edge_pct', ascending=False).drop(columns='abs_edge_pct')
 
@@ -332,3 +334,12 @@ def scan_for_arbitrage(options_df, S0, r, q=0.0,
     if return_diagnostics:
         return result_df, diagnostics
     return result_df
+
+
+def scan_for_arbitrage(*args, **kwargs):
+    """
+    Backward-compatible alias for older callers.
+
+    New code should use scan_for_valuation_gaps().
+    """
+    return scan_for_valuation_gaps(*args, **kwargs)

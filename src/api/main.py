@@ -1,7 +1,7 @@
 """
 api/main.py
 
-FastAPI backend for the Quant Terminal.
+FastAPI backend for the Quant Research Terminal.
 Returns structured scan payloads with diagnostics so the frontend can
 surface trust and data-quality metadata alongside pricing output.
 """
@@ -11,9 +11,9 @@ from pydantic import BaseModel
 import pandas as pd
 from datetime import datetime, timezone
 import uuid
-from src.core.scanner_engine import scan_for_arbitrage
+from src.core.scanner_engine import scan_for_valuation_gaps
 
-app = FastAPI(title="Quant Terminal API", version="2.0")
+app = FastAPI(title="Quant Research Terminal API", version="2.0")
 
 class ScanRequest(BaseModel):
     ticker: str
@@ -36,7 +36,7 @@ class ScanRequest(BaseModel):
 
 @app.get("/")
 async def root():
-    return {"status": "online", "application": "Quant Terminal Engine V2"}
+    return {"status": "online", "application": "Quant Research Terminal Engine V2"}
 
 @app.post("/scan")
 async def run_options_scan(req: ScanRequest):
@@ -54,7 +54,7 @@ async def run_options_scan(req: ScanRequest):
         fallback_vol = req.historical_vol
             
         # Run Pricing Engine
-        result_df, diagnostics = scan_for_arbitrage(
+        result_df, diagnostics = scan_for_valuation_gaps(
             options_df, S0, req.r, req.q,
             model=req.model,
             n_sims=req.n_sims,
