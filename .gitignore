@@ -26,3 +26,5 @@ htmlcov/
 .gemini/
 docs/archive/
 docs/
+
+.csv
