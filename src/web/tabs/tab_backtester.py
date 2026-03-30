@@ -11,7 +11,13 @@ import streamlit as st
 import plotly.graph_objects as go
 import pandas as pd
 
-from src.core.backtester import run_synthetic_backtest
+from src.core.backtester import (
+    FULL_HISTORICAL_PERIOD,
+    get_historical_option_quote_range,
+    has_historical_option_quotes,
+    run_historical_quotes_backtest,
+    run_synthetic_backtest,
+)
 
 
 def render(ticker, option_type, n_sims,
@@ -28,39 +34,71 @@ def render(ticker, option_type, n_sims,
 
         1. **Daily Delta-Hedging**: Rebalances the underlying daily to isolate volatility-driven PnL from outright directional exposure.
         2. **No Look-Ahead Bias**: Rolling volatility is computed strictly from observations before each trade date.
-        3. **Proxy Market Entry**: The model fair value comes from Heston or Jump Diffusion, but entry uses a Black-Scholes proxy market price because historical option quotes are not replayed.
-        4. **Interpretation**: Returns and Sharpe should be treated as controlled research evidence, not proof of executable historical fills.
+        3. **Data Source**:
+           - **Historical SPX Quotes (CSV)** uses the pasted `combined_options_data.csv` bid/ask snapshots.
+           - **Synthetic Proxy** prices entry off a Black-Scholes proxy when historical option quotes are not replayed.
+        4. **Interpretation**: Returns and Sharpe remain research metrics, especially because hedging is still simulated from daily closes.
 
         **Key Parameters**:
         - **Edge Threshold**: Minimum % difference between model fair value and market price to trigger trade entry
-        - **Term Structure**: Target option expirations (Days To Expiry) to scan for candidate valuation gaps
+        - **Historical CSV Mode**: Scans the full pasted SPX options file instead of asking for DTE targets
         - **Model**: Choose between Heston (stochastic volatility) or Jump Diffusion (crash events)
         """)
 
     st.markdown("---")
 
+    historical_available = has_historical_option_quotes()
+    supported_historical_ticker = str(ticker).upper() in {"SPX", "^SPX"}
+    source_options = ["Synthetic Proxy"]
+    if historical_available and supported_historical_ticker:
+        source_options.insert(0, "Historical SPX Quotes (CSV)")
+
+    bt_source = st.radio("Backtest Data Source", source_options, horizontal=True)
+    historical_mode = bt_source == "Historical SPX Quotes (CSV)"
+    csv_start, csv_end = (None, None)
+    if historical_available:
+        csv_start, csv_end = get_historical_option_quote_range()
+
+    if historical_mode and csv_start and csv_end:
+        st.caption(
+            f"Using the full local CSV range: {csv_start.strftime('%Y-%m-%d')} to {csv_end.strftime('%Y-%m-%d')}. "
+            "This local file does not currently extend to 2023."
+        )
+    elif not historical_available:
+        st.caption("Historical quote mode is unavailable until `combined_options_data.csv` is present in the project root.")
+    elif not supported_historical_ticker:
+        st.caption("Historical quote mode currently supports SPX only. Other tickers fall back to the synthetic proxy.")
+
     # --- Backtester Controls ---
-    bt_col1, bt_col2, bt_col3, bt_col4, bt_col5, bt_col6 = st.columns([1, 1, 1.2, 1, 1.5, 1.2])
+    bt_col1, bt_col2, bt_col3, bt_col4 = st.columns([1, 1, 1.2, 1.2])
     with bt_col1:
         bt_capital = st.number_input("Capital ($)", value=10000.0, min_value=1000.0, step=1000.0)
     with bt_col2:
-        bt_period = st.selectbox("Period", ["1y", "2y", "3y", "5y"], index=1)
+        if historical_mode:
+            st.text_input("Period", value="Full CSV", disabled=True)
+            bt_period = FULL_HISTORICAL_PERIOD
+        else:
+            bt_period = st.selectbox("Period", ["1y", "2y", "3y", "5y"], index=1)
     with bt_col3:
         bt_edge = st.number_input("Edge Threshold (%)", min_value=1, max_value=30, value=10, step=1)
     with bt_col4:
         bt_model = st.selectbox("Model", ["jump_diffusion", "heston"])
-    with bt_col5:
+    if historical_mode:
+        st.text_input("Expiration Selection", value="Automatic scan across the full CSV", disabled=True)
+        bt_exps = None
+    else:
         bt_exps = st.multiselect("Term Structure", [7, 14, 21, 30, 60, 90, 120, 150, 180], default=[30, 60, 90])
-    with bt_col6:
-        st.markdown("")
-        bt_button = st.button("RUN BACKTEST", type="primary", use_container_width=True)
+
+    bt_button = st.button("RUN BACKTEST", type="primary", use_container_width=True)
 
     st.markdown("---")
 
     if bt_button:
-        with st.spinner(f"Backtesting {bt_model} over {bt_period} of {ticker}..."):
+        spinner_label = f"Backtesting {bt_model} on the full CSV for {ticker}..." if historical_mode else f"Backtesting {bt_model} over {bt_period} of {ticker}..."
+        with st.spinner(spinner_label):
             try:
-                results = run_synthetic_backtest(
+                runner = run_historical_quotes_backtest if bt_source == "Historical SPX Quotes (CSV)" else run_synthetic_backtest
+                results = runner(
                     ticker=ticker, period=bt_period, initial_capital=bt_capital,
                     option_type=option_type.lower(), edge_threshold=bt_edge / 100.0,
                     risk_free_rate=0.05, n_sims=n_sims, model=bt_model,
@@ -78,22 +116,43 @@ def render(ticker, option_type, n_sims,
             return
 
         methodology = results.get('methodology', {})
-        if not methodology.get('uses_historical_option_quotes', True):
-            st.warning(methodology.get('disclosure', 'This backtest uses a synthetic market-price proxy rather than historical option quotes.'))
+        disclosure = methodology.get('disclosure')
+        if methodology.get('uses_historical_option_quotes', False):
+            st.info(disclosure)
+            quote_filters = methodology.get("quote_filters", {})
+            if quote_filters:
+                st.caption(
+                    f"Quote filters: bid >= {quote_filters.get('min_bid', 'n/a')}, "
+                    f"spread <= {quote_filters.get('max_spread_pct', 0) * 100:.0f}% of mid, "
+                    f"positive IV required."
+                )
+        else:
+            st.warning(disclosure or 'This backtest uses a synthetic market-price proxy rather than historical option quotes.')
 
         meta1, meta2, meta3 = st.columns(3)
         meta1.metric("Fair Value Model", methodology.get('fair_value_model', bt_model).upper())
-        meta2.metric("Entry Price Source", "BS Proxy" if methodology.get('entry_market_price_source') else "Unknown")
+        entry_source_label = methodology.get('entry_market_price_source', 'unknown')
+        if entry_source_label == "black_scholes_proxy_from_rolling_vol":
+            entry_source_label = "BS Proxy"
+        elif entry_source_label == "historical_option_bid_ask_mid":
+            entry_source_label = "Hist. Bid/Ask"
+        meta2.metric("Entry Price Source", entry_source_label)
         meta3.metric("Look-Ahead Guard", "ON" if methodology.get('lookahead_guard') else "OFF")
+        if methodology.get('data_start') and methodology.get('data_end'):
+            st.caption(f"Historical quote window: {methodology['data_start']} to {methodology['data_end']}")
+        if methodology.get('solvency_breach_triggered'):
+            st.error("Solvency guard triggered during the backtest. Open positions were force-liquidated and Sharpe is suppressed.")
 
-        km1, km2, km3, km4, km5, km6 = st.columns(6)
+        km1, km2, km3, km4, km5, km6, km7 = st.columns(7)
         pnl = results['final_value'] - bt_capital
-        km1.metric("Final Value", f"${results['final_value']:,.2f}", delta=f"${pnl:+,.2f}", delta_color="normal")
-        km2.metric("Return", f"{results['total_return_pct']:+.1f}%")
-        km3.metric("Win Rate", f"{results['win_rate']:.0f}%")
-        km4.metric("Trades", f"{results['total_trades']}")
-        km5.metric("Sharpe", f"{results['sharpe_ratio']:.2f}")
-        km6.metric("Max DD", f"{results['max_drawdown_pct']:.1f}%")
+        sharpe_value = results.get('sharpe_ratio')
+        km1.metric("Final Value", f"${results['final_value']:,.2f}")
+        km2.metric("Net P&L", f"${pnl:+,.2f}")
+        km3.metric("Return", f"{results['total_return_pct']:+.1f}%")
+        km4.metric("Win Rate", f"{results['win_rate']:.0f}%")
+        km5.metric("Trades", f"{results['total_trades']}")
+        km6.metric("Sharpe", "N/A" if pd.isna(sharpe_value) else f"{sharpe_value:.2f}")
+        km7.metric("Max DD", f"{results['max_drawdown_pct']:.1f}%")
 
         st.markdown("---")
         st.subheader("Equity Curve")
@@ -101,8 +160,8 @@ def render(ticker, option_type, n_sims,
         if not equity_df.empty and len(equity_df) > 1:
             fig_eq = go.Figure()
             fig_eq.add_trace(go.Scatter(
-                x=equity_df['date'], y=equity_df['value'],
-                mode='lines+markers', name='Portfolio',
+                x=equity_df['date'], y=equity_df['net_value'],
+                mode='lines+markers', name='Net Portfolio',
                 line=dict(color='#00FF00', width=2), marker=dict(size=4)))
             fig_eq.add_hline(y=bt_capital, line_dash="dash", line_color="gray",
                 annotation_text=f"Start: ${bt_capital:,.0f}")
@@ -115,11 +174,15 @@ def render(ticker, option_type, n_sims,
         trades_df = results['trades_df']
         if not trades_df.empty:
             # Compact view: essential columns only
-            compact_cols = ['entry_date', 'expiry_date', 'strike', 'mc_fair_value', 'market_proxy_price', 'pnl_net', 'result']
+            price_col = 'market_mid' if 'market_mid' in trades_df.columns else 'market_proxy_price'
+            exit_col = 'exit_date' if 'exit_date' in trades_df.columns else 'expiry_date'
+            compact_cols = ['entry_date', exit_col, 'contracts', 'strike', 'mc_fair_value', price_col, 'pnl_net', 'result']
             compact_df = trades_df[[col for col in compact_cols if col in trades_df.columns]].copy()
             compact_df = compact_df.rename(columns={
-                'entry_date': 'Entry', 'expiry_date': 'Exit',
+                'entry_date': 'Entry', 'exit_date': 'Exit', 'expiry_date': 'Exit',
+                'contracts': 'Contracts',
                 'strike': 'Strike', 'mc_fair_value': 'Fair Value', 'market_proxy_price': 'Mkt Proxy',
+                'market_mid': 'Mkt Mid',
                 'pnl_net': 'P&L ($)', 'result': 'Result'
             })
 
@@ -163,7 +226,10 @@ def render(ticker, option_type, n_sims,
                 styled_trades = trades_df.style.map(_color_result, subset=['result'])
                 st.dataframe(styled_trades, width='stretch', hide_index=True)
         else:
-            st.info("No trades triggered. Try lowering the Edge Threshold.")
+            if methodology.get('uses_historical_option_quotes', False):
+                st.info("No trades triggered. With SPX quote mode, the 100x contract multiplier, quote filters, and hedge reserve can make a small account ineligible even when edge exists.")
+            else:
+                st.info("No trades triggered. Try lowering the Edge Threshold.")
 
         st.markdown("---")
         st.subheader("Cost Sensitivity Analysis")
@@ -219,3 +285,11 @@ def render(ticker, option_type, n_sims,
 
                 st.write(f"**Avg Entry Edge**: {cost_summary['avg_entry_edge_pct']:.2f}%")
                 st.write(f"**Rebalance Threshold**: {cost_summary['hedge_rebalance_delta_threshold']:.4f}")
+                if 'option_multiplier' in cost_summary:
+                    st.write(f"**Contract Multiplier**: {cost_summary['option_multiplier']}x")
+                if 'hedge_margin_ratio' in cost_summary:
+                    st.write(f"**Hedge Reserve**: {cost_summary['hedge_margin_ratio'] * 100:.0f}% of initial hedge notional")
+                if 'max_open_positions' in cost_summary:
+                    st.write(f"**Max Concurrent Positions**: {cost_summary['max_open_positions']}")
+                if cost_summary.get('forced_liquidations', 0):
+                    st.write(f"**Forced Liquidations**: {cost_summary['forced_liquidations']}")

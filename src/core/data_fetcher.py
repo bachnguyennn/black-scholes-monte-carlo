@@ -14,6 +14,7 @@ enough for this UI.
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -25,6 +26,8 @@ import pandas as pd
 import requests
 import yfinance as yf
 
+
+logger = logging.getLogger(__name__)
 
 POLYGON_BASE_URL = "https://api.polygon.io"
 SUPPORTED_MARKET_DATA_PROVIDERS = {"auto", "polygon", "yfinance"}
@@ -59,6 +62,44 @@ class MarketDataConfig:
         return self.provider_preference == "auto" and self.polygon_enabled
 
 
+@dataclass(frozen=True)
+class MarketDataSnapshot:
+    ticker_symbol: str
+    spot: float
+    historical_vol: float
+    name: str
+    history: pd.Series
+    provider: str
+    requested_provider: str
+    fallback_from: str | None
+    provider_note: str
+    as_of: pd.Timestamp
+    history_start: pd.Timestamp
+    history_end: pd.Timestamp
+    history_points: int
+    is_stale: bool
+    validation_warnings: tuple[str, ...]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "ticker_symbol": self.ticker_symbol,
+            "spot": self.spot,
+            "historical_vol": self.historical_vol,
+            "name": self.name,
+            "history": self.history,
+            "provider": self.provider,
+            "requested_provider": self.requested_provider,
+            "fallback_from": self.fallback_from,
+            "provider_note": self.provider_note,
+            "as_of": self.as_of,
+            "history_start": self.history_start,
+            "history_end": self.history_end,
+            "history_points": self.history_points,
+            "is_stale": self.is_stale,
+            "validation_warnings": list(self.validation_warnings),
+        }
+
+
 class YFinanceMarketDataProvider:
     name = "yfinance"
 
@@ -69,25 +110,26 @@ class YFinanceMarketDataProvider:
             if history.empty:
                 return None
 
-            spot = float(history["Close"].iloc[-1])
-            log_returns = np.log(history["Close"] / history["Close"].shift(1)).dropna()
-            hist_vol = float(log_returns.std() * np.sqrt(252))
-            hist_vol = min(max(hist_vol, 0.05), 2.0)
+            close_history = history["Close"]
+            spot = float(close_history.iloc[-1])
+            hist_vol = _compute_history_volatility(close_history)
 
             return {
                 "spot": spot,
                 "historical_vol": hist_vol,
                 "name": tk.info.get("longName", ticker_symbol),
-                "history": history["Close"],
+                "history": close_history,
             }
-        except Exception:
+        except Exception as exc:
+            logger.warning("yfinance spot/history fetch failed for %s: %s", ticker_symbol, exc)
             return None
 
     def get_available_expirations(self, ticker_symbol: str) -> list[str]:
         try:
             tk = yf.Ticker(ticker_symbol)
             return list(tk.options)
-        except Exception:
+        except Exception as exc:
+            logger.warning("yfinance expiration fetch failed for %s: %s", ticker_symbol, exc)
             return []
 
     def get_options_chain(
@@ -136,7 +178,7 @@ class YFinanceMarketDataProvider:
             df = df[(df["volume"] > 0) | (df["openInterest"] > 10)]
             return df.reset_index(drop=True)
         except Exception as exc:
-            print(f"Error fetching options chain from yfinance: {exc}")
+            logger.warning("yfinance options-chain fetch failed for %s: %s", ticker_symbol, exc)
             return pd.DataFrame()
 
 
@@ -152,14 +194,9 @@ class PolygonMarketDataProvider:
         if history.empty:
             return None
 
-        spot = float(history.iloc[-1])
-        log_returns = np.log(history / history.shift(1)).dropna()
-        hist_vol = float(log_returns.std() * np.sqrt(252))
-        hist_vol = min(max(hist_vol, 0.05), 2.0)
-
         return {
-            "spot": spot,
-            "historical_vol": hist_vol,
+            "spot": float(history.iloc[-1]),
+            "historical_vol": _compute_history_volatility(history),
             "name": self._fetch_ticker_name(ticker_symbol),
             "history": history,
         }
@@ -214,8 +251,7 @@ class PolygonMarketDataProvider:
 
         timestamps = pd.to_datetime([row["t"] for row in results], unit="ms", utc=True)
         closes = [float(row["c"]) for row in results]
-        series = pd.Series(closes, index=timestamps, name="Close")
-        return series
+        return pd.Series(closes, index=timestamps, name="Close")
 
     def _fetch_ticker_name(self, ticker_symbol: str) -> str:
         if _is_index_symbol(ticker_symbol):
@@ -226,7 +262,8 @@ class PolygonMarketDataProvider:
         try:
             payload = self._request_json(url)
             return payload.get("results", {}).get("name", ticker_symbol)
-        except Exception:
+        except Exception as exc:
+            logger.info("polygon ticker-name lookup failed for %s: %s", ticker_symbol, exc)
             return ticker_symbol
 
     def _request_json(self, url: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -281,35 +318,67 @@ def get_market_data_runtime_summary() -> dict[str, Any]:
         "expirations_provider": expirations_provider,
         "options_chain_provider": "yfinance",
         "options_chain_note": OPTIONS_CHAIN_FALLBACK_NOTE,
+        "max_staleness_days": get_market_data_max_staleness_days(),
+        "min_history_points": get_market_data_min_history_points(),
         "note": note,
     }
 
 
-def get_spot_and_vol(ticker_symbol: str) -> dict[str, Any] | None:
+def get_market_data_max_staleness_days() -> int:
+    return _read_positive_int_env("MARKET_DATA_MAX_STALENESS_DAYS", default=5)
+
+
+def get_market_data_min_history_points() -> int:
+    return _read_positive_int_env("MARKET_DATA_MIN_HISTORY_POINTS", default=30)
+
+
+def get_spot_snapshot(ticker_symbol: str) -> MarketDataSnapshot | None:
     requested_provider = _requested_provider_label()
     primary_provider = _build_primary_provider_for_workflow("spot_history")
-    primary_data = primary_provider.get_spot_and_vol(ticker_symbol)
+    primary_raw = _safe_fetch_spot_payload(primary_provider, ticker_symbol)
+    primary_snapshot = _normalize_market_snapshot(
+        raw_payload=primary_raw,
+        ticker_symbol=ticker_symbol,
+        provider=primary_provider.name,
+        requested_provider=requested_provider,
+        fallback_from=None,
+    )
 
-    if primary_data:
-        return _attach_provider_metadata(
-            primary_data,
-            provider=primary_provider.name,
-            requested_provider=requested_provider,
-            fallback_from=None,
-        )
+    if primary_snapshot and _snapshot_supports_research_workflow(primary_snapshot):
+        _log_snapshot_resolution(primary_snapshot, degraded=False)
+        return primary_snapshot
 
     if primary_provider.name == "polygon":
-        fallback_provider = YFinanceMarketDataProvider()
-        fallback_data = fallback_provider.get_spot_and_vol(ticker_symbol)
-        if fallback_data:
-            return _attach_provider_metadata(
-                fallback_data,
-                provider=fallback_provider.name,
-                requested_provider=requested_provider,
-                fallback_from="polygon",
-            )
+        fallback_reason = _snapshot_issue_summary(primary_snapshot) if primary_snapshot else "primary provider returned no usable snapshot"
+        logger.warning(
+            "market_data_fallback ticker=%s from=%s to=yfinance reason=%s",
+            ticker_symbol,
+            primary_provider.name,
+            fallback_reason,
+        )
+        fallback_raw = _safe_fetch_spot_payload(YFinanceMarketDataProvider(), ticker_symbol)
+        fallback_snapshot = _normalize_market_snapshot(
+            raw_payload=fallback_raw,
+            ticker_symbol=ticker_symbol,
+            provider="yfinance",
+            requested_provider=requested_provider,
+            fallback_from="polygon",
+        )
+        if fallback_snapshot:
+            _log_snapshot_resolution(fallback_snapshot, degraded=not _snapshot_supports_research_workflow(fallback_snapshot))
+            return fallback_snapshot
 
+    if primary_snapshot:
+        _log_snapshot_resolution(primary_snapshot, degraded=True)
+        return primary_snapshot
+
+    logger.error("market_data_unavailable ticker=%s workflow=spot_history requested=%s", ticker_symbol, requested_provider)
     return None
+
+
+def get_spot_and_vol(ticker_symbol: str) -> dict[str, Any] | None:
+    snapshot = get_spot_snapshot(ticker_symbol)
+    return snapshot.to_dict() if snapshot else None
 
 
 def get_risk_free_rate() -> float:
@@ -331,14 +400,32 @@ def get_available_expirations(ticker_symbol: str) -> list[str]:
     primary_provider = _build_primary_provider_for_workflow("expirations")
 
     try:
-        expirations = primary_provider.get_available_expirations(ticker_symbol)
+        expirations = _normalize_expiration_list(primary_provider.get_available_expirations(ticker_symbol))
         if expirations:
+            logger.info(
+                "market_data_expirations_resolved ticker=%s provider=%s count=%s",
+                ticker_symbol,
+                primary_provider.name,
+                len(expirations),
+            )
             return expirations
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.warning(
+            "market_data_expirations_failed ticker=%s provider=%s error=%s",
+            ticker_symbol,
+            primary_provider.name,
+            exc,
+        )
 
     if primary_provider.name == "polygon":
-        return YFinanceMarketDataProvider().get_available_expirations(ticker_symbol)
+        fallback_expirations = _normalize_expiration_list(YFinanceMarketDataProvider().get_available_expirations(ticker_symbol))
+        if fallback_expirations:
+            logger.warning(
+                "market_data_expirations_fallback ticker=%s from=polygon to=yfinance count=%s",
+                ticker_symbol,
+                len(fallback_expirations),
+            )
+        return fallback_expirations
     return []
 
 
@@ -380,21 +467,172 @@ def _requested_provider_label() -> str:
     return config.provider_preference
 
 
-def _attach_provider_metadata(
-    payload: dict[str, Any],
+def _safe_fetch_spot_payload(provider: YFinanceMarketDataProvider | PolygonMarketDataProvider, ticker_symbol: str) -> dict[str, Any] | None:
+    try:
+        return provider.get_spot_and_vol(ticker_symbol)
+    except Exception as exc:
+        logger.warning(
+            "market_data_fetch_failed ticker=%s provider=%s workflow=spot_history error=%s",
+            ticker_symbol,
+            provider.name,
+            exc,
+        )
+        return None
+
+
+def _normalize_market_snapshot(
+    raw_payload: dict[str, Any] | None,
+    ticker_symbol: str,
     provider: str,
     requested_provider: str,
     fallback_from: str | None,
-) -> dict[str, Any]:
-    enriched = dict(payload)
-    enriched["provider"] = provider
-    enriched["requested_provider"] = requested_provider
-    enriched["fallback_from"] = fallback_from
-    if fallback_from:
-        enriched["provider_note"] = f"Fell back from {fallback_from} to {provider} for this request."
+) -> MarketDataSnapshot | None:
+    if not raw_payload:
+        return None
+
+    history = _coerce_history_series(raw_payload.get("history"))
+    if history is None or history.empty:
+        logger.warning("market_data_invalid_history ticker=%s provider=%s", ticker_symbol, provider)
+        return None
+
+    history_start = history.index.min()
+    history_end = history.index.max()
+    history_points = len(history)
+    as_of = history_end
+    warnings: list[str] = []
+
+    if history_points < get_market_data_min_history_points():
+        warnings.append(f"Limited history returned ({history_points} points).")
+
+    age = pd.Timestamp.now(tz="UTC") - as_of
+    is_stale = age > pd.Timedelta(days=get_market_data_max_staleness_days())
+    if is_stale:
+        warnings.append(f"Market data is stale ({int(age.total_seconds() // 86400)}d old).")
+
+    spot = _coerce_positive_float(raw_payload.get("spot"))
+    last_close = float(history.iloc[-1])
+    if spot is None:
+        spot = last_close
+        warnings.append("Spot price was normalized from the close history.")
+
+    hist_vol = _coerce_positive_float(raw_payload.get("historical_vol"))
+    if hist_vol is None:
+        hist_vol = _compute_history_volatility(history)
+        warnings.append("Historical volatility was recomputed from the close history.")
+    if not np.isfinite(hist_vol) or hist_vol <= 0:
+        hist_vol = 0.2
+        warnings.append("Historical volatility fallback of 20% was used due to insufficient history.")
+
+    hist_vol = float(min(max(hist_vol, 0.05), 2.0))
+    provider_note = _build_provider_note(provider, fallback_from, warnings)
+
+    return MarketDataSnapshot(
+        ticker_symbol=ticker_symbol,
+        spot=float(spot),
+        historical_vol=hist_vol,
+        name=str(raw_payload.get("name") or ticker_symbol),
+        history=history,
+        provider=provider,
+        requested_provider=requested_provider,
+        fallback_from=fallback_from,
+        provider_note=provider_note,
+        as_of=as_of,
+        history_start=history_start,
+        history_end=history_end,
+        history_points=history_points,
+        is_stale=is_stale,
+        validation_warnings=tuple(warnings),
+    )
+
+
+def _snapshot_supports_research_workflow(snapshot: MarketDataSnapshot) -> bool:
+    return not snapshot.is_stale and snapshot.history_points >= get_market_data_min_history_points()
+
+
+def _snapshot_issue_summary(snapshot: MarketDataSnapshot | None) -> str:
+    if snapshot is None:
+        return "snapshot normalization failed"
+    if snapshot.validation_warnings:
+        return "; ".join(snapshot.validation_warnings)
+    return "snapshot failed validation"
+
+
+def _log_snapshot_resolution(snapshot: MarketDataSnapshot, degraded: bool) -> None:
+    logger.log(
+        logging.WARNING if degraded else logging.INFO,
+        "market_data_snapshot_resolved ticker=%s provider=%s requested=%s fallback_from=%s stale=%s history_points=%s warnings=%s",
+        snapshot.ticker_symbol,
+        snapshot.provider,
+        snapshot.requested_provider,
+        snapshot.fallback_from or "-",
+        snapshot.is_stale,
+        snapshot.history_points,
+        len(snapshot.validation_warnings),
+    )
+
+
+def _coerce_history_series(raw_history: Any) -> pd.Series | None:
+    if isinstance(raw_history, pd.Series):
+        history = raw_history.copy()
+    elif isinstance(raw_history, pd.DataFrame) and "Close" in raw_history.columns:
+        history = raw_history["Close"].copy()
     else:
-        enriched["provider_note"] = f"Served by {provider}."
-    return enriched
+        return None
+
+    history = pd.to_numeric(history, errors="coerce").dropna()
+    if history.empty:
+        return None
+
+    index = pd.to_datetime(history.index, errors="coerce", utc=True)
+    valid_mask = ~index.isna()
+    history = history[valid_mask]
+    index = index[valid_mask]
+    if history.empty:
+        return None
+
+    history.index = index
+    history = history.sort_index()
+    history = history[~history.index.duplicated(keep="last")]
+    history.name = "Close"
+    return history
+
+
+def _compute_history_volatility(history: pd.Series) -> float:
+    log_returns = np.log(history / history.shift(1)).dropna()
+    if log_returns.empty:
+        return 0.2
+    return float(log_returns.std() * np.sqrt(252))
+
+
+def _build_provider_note(provider: str, fallback_from: str | None, warnings: list[str]) -> str:
+    if fallback_from:
+        prefix = f"Fell back from {fallback_from} to {provider} for this request."
+    else:
+        prefix = f"Served by {provider}."
+
+    if warnings:
+        return f"{prefix} Validation: {' '.join(warnings)}"
+    return prefix
+
+
+def _normalize_expiration_list(expirations: list[str]) -> list[str]:
+    normalized: set[str] = set()
+    for exp_str in expirations:
+        try:
+            normalized.add(datetime.strptime(exp_str, "%Y-%m-%d").strftime("%Y-%m-%d"))
+        except Exception:
+            continue
+    return sorted(normalized)
+
+
+def _coerce_positive_float(value: Any) -> float | None:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not np.isfinite(number) or number <= 0:
+        return None
+    return number
 
 
 def _normalize_option_rows(df: pd.DataFrame, expiration: str, T: float, option_type: str) -> list[dict[str, Any]]:
@@ -420,6 +658,15 @@ def _normalize_option_rows(df: pd.DataFrame, expiration: str, T: float, option_t
             }
         )
     return rows
+
+
+def _read_positive_int_env(name: str, default: int) -> int:
+    raw_value = os.getenv(name, str(default)).strip()
+    try:
+        parsed = int(raw_value)
+    except ValueError:
+        return default
+    return parsed if parsed > 0 else default
 
 
 def _is_index_symbol(ticker_symbol: str) -> bool:

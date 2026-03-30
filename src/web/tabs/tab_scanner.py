@@ -20,6 +20,7 @@ from src.core.data_fetcher import (
     get_risk_free_rate,
     get_spot_and_vol,
 )
+from src.core.model_evaluation import build_live_surface_evaluation
 from src.core.scanner_engine import scan_for_valuation_gaps
 from src.core.calibration_engine import calibrate_heston, calibrate_lsv
 
@@ -59,6 +60,16 @@ def _style_edge(val):
     except Exception:
         pass
     return ''
+
+
+def _format_metric_value(value, fmt):
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return "n/a"
+    if pd.isna(numeric):
+        return "n/a"
+    return format(numeric, fmt)
 
 
 def _build_expiration_choices(available_exps):
@@ -109,6 +120,34 @@ def _extract_api_detail(response):
     return response.text
 
 
+def _format_as_of_timestamp(value):
+    if value is None:
+        return "n/a"
+    try:
+        return value.tz_convert("UTC").strftime("%Y-%m-%d %H:%M UTC")
+    except Exception:
+        try:
+            return value.strftime("%Y-%m-%d %H:%M")
+        except Exception:
+            return str(value)
+
+
+def _build_spot_metadata_warning(spot_data):
+    if not spot_data:
+        return ""
+
+    warning_parts = []
+    if spot_data.get("fallback_from"):
+        warning_parts.append(
+            f"spot/history fell back from {spot_data['fallback_from']} to {spot_data.get('provider', 'yfinance')}"
+        )
+    if spot_data.get("is_stale"):
+        warning_parts.append("spot/history snapshot is flagged stale")
+    if spot_data.get("validation_warnings"):
+        warning_parts.append("validation: " + " ".join(spot_data["validation_warnings"]))
+    return "; ".join(warning_parts)
+
+
 def render(ticker, model_type, default_vol, n_sims,
            jump_intensity, jump_mean, jump_std,
            heston_V0, heston_kappa, heston_theta, heston_xi, heston_rho):
@@ -117,8 +156,23 @@ def render(ticker, model_type, default_vol, n_sims,
     st.subheader(f"Live Valuation Gap Scanner: {ticker}")
     st.caption("Signals rank model-versus-market valuation gaps and include data-quality diagnostics so you can explain what was filtered, how volatility was sourced, and which engine produced the prices.")
     market_data_summary = get_market_data_runtime_summary()
-    if market_data_summary["provider_preference"] != "yfinance":
-        st.info(market_data_summary["options_chain_note"])
+    spot_metadata = fetch_spot_data(ticker)
+
+    st.info(
+        "Pre-scan provenance: options chain inputs in this tab use yfinance. "
+        "If polygon is preferred, it only affects supported spot/history and expiration metadata."
+    )
+    if spot_metadata:
+        st.caption(
+            f"Spot/history source: {spot_metadata.get('provider', 'yfinance')} "
+            f"(requested {spot_metadata.get('requested_provider', spot_metadata.get('provider', 'yfinance'))}, "
+            f"as of {_format_as_of_timestamp(spot_metadata.get('as_of'))})"
+        )
+    provenance_warning = _build_spot_metadata_warning(spot_metadata)
+    if provenance_warning:
+        st.warning(f"Spot/history provenance warning: {provenance_warning}")
+    elif market_data_summary["provider_preference"] != "yfinance":
+        st.caption(market_data_summary["options_chain_note"])
 
     scan_col1, scan_col2, scan_col3 = st.columns([2, 2, 1])
     with scan_col1:
@@ -263,6 +317,10 @@ def render(ticker, model_type, default_vol, n_sims,
         ctx2.metric("Hist Vol", f"{hist_vol*100:.1f}%")
         ctx3.metric("Risk-Free", f"{r_live*100:.2f}%")
         ctx4.metric("Contracts", f"{len(options_df)}")
+        st.caption(
+            f"Spot/Vol source: {spot_data.get('provider', 'yfinance')} "
+            f"(as of {_format_as_of_timestamp(spot_data.get('as_of'))})"
+        )
         st.markdown("---")
 
         model_map = {
@@ -358,6 +416,33 @@ def render(ticker, model_type, default_vol, n_sims,
         sig2.metric("[ BUY ]", buys)
         sig3.metric("[ SELL ]", sells)
         sig4.metric("[ HOLD ]", holds)
+
+        surface_eval = build_live_surface_evaluation(results_df, S0, r_live)
+        st.markdown("---")
+        st.subheader("Model Evaluation")
+        st.caption(
+            "These are quote-based live-surface diagnostics. Use them to judge model quality before "
+            "leaning on synthetic backtest returns."
+        )
+        if surface_eval.get("success"):
+            ev1, ev2, ev3, ev4, ev5 = st.columns(5)
+            ev1.metric("Price MAE", f"${_format_metric_value(surface_eval['price_mae'], '.4f')}")
+            ev2.metric("Price RMSE", f"${_format_metric_value(surface_eval['price_rmse'], '.4f')}")
+            ev3.metric("IV MAE", f"{_format_metric_value(surface_eval['iv_mae_pct_pts'], '.2f')} pts")
+            ev4.metric("Within NBBO", f"{_format_metric_value(surface_eval['within_nbbo_pct'], '.1f')}%")
+            ev5.metric("Abs Error / Spread", f"{_format_metric_value(surface_eval['mean_abs_error_in_spreads'], '.2f')}x")
+
+            with st.expander("Why these metrics matter", expanded=False):
+                st.markdown(
+                    f"""
+                    - **Evaluation scope:** {surface_eval['contracts_evaluated']} priced contracts, with IV error available on {surface_eval['iv_contracts_evaluated']}.
+                    - **Primary use:** compare model prices to observed live quotes on the option surface.
+                    - **Execution-aware lens:** `Abs Error / Spread` and `Within NBBO` tell you whether pricing error is small relative to quoted trading frictions.
+                    - **Current limitation:** true out-of-sample walk-forward surface testing and delta-hedged residual PnL need archived historical option quotes, which this repo does not store yet.
+                    """
+                )
+        else:
+            st.info(surface_eval.get("message", "Surface evaluation unavailable."))
 
         with st.expander("Scanner Diagnostics & Data Quality"):
             d1, d2, d3 = st.columns(3)

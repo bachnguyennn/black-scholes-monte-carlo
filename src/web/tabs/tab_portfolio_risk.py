@@ -28,7 +28,35 @@ def fetch_cached_options_chain(ticker, max_expirations=10):
     return get_options_chain(ticker, max_expirations=max_expirations)
 
 
-def render(ticker, default_spot):
+def _format_as_of_timestamp(value):
+    if value is None:
+        return "n/a"
+    try:
+        return value.tz_convert("UTC").strftime("%Y-%m-%d %H:%M UTC")
+    except Exception:
+        try:
+            return value.strftime("%Y-%m-%d %H:%M")
+        except Exception:
+            return str(value)
+
+
+def _build_spot_provenance_warning(asset_data):
+    if not asset_data:
+        return ""
+
+    warning_parts = []
+    if asset_data.get("fallback_from"):
+        warning_parts.append(
+            f"spot defaults fell back from {asset_data['fallback_from']} to {asset_data.get('provider', 'yfinance')}"
+        )
+    if asset_data.get("is_stale"):
+        warning_parts.append("spot/history snapshot is flagged stale")
+    if asset_data.get("validation_warnings"):
+        warning_parts.append("validation: " + " ".join(asset_data["validation_warnings"]))
+    return "; ".join(warning_parts)
+
+
+def render(ticker, default_spot, asset_data=None):
     """
     Renders the Portfolio Risk tab with dual modes:
     1. Theoretical Risk Surfaces (Spot x Vol x Greek)
@@ -109,8 +137,26 @@ def render(ticker, default_spot):
         # --- Market IV Surface Mode ---
         st.markdown("Visualizing the live Market Implied Volatility surface across Strike and Maturity.")
         market_data_summary = get_market_data_runtime_summary()
+        resolved_provider = "manual default"
+        if asset_data:
+            resolved_provider = asset_data.get("provider", "yfinance")
+
+        st.info(
+            "IV surface inputs: yfinance options chain. "
+            f"Spot defaults source: {resolved_provider}. "
+            "This view mixes options-chain inputs with the shared spot/history snapshot used for defaults."
+        )
+        if asset_data:
+            st.caption(
+                f"Spot/history requested: {asset_data.get('requested_provider', resolved_provider)} | "
+                f"as of {_format_as_of_timestamp(asset_data.get('as_of'))} | "
+                f"history points: {asset_data.get('history_points', 'n/a')}"
+            )
         if market_data_summary["provider_preference"] != "yfinance":
-            st.info(market_data_summary["options_chain_note"])
+            st.caption(market_data_summary["options_chain_note"])
+        spot_warning = _build_spot_provenance_warning(asset_data)
+        if spot_warning:
+            st.warning(f"Spot/default provenance warning: {spot_warning}")
 
         # Add refresh control
         refresh_col1, refresh_col2 = st.columns([3, 1])

@@ -5,6 +5,7 @@ streamlit>=1.30.0
 plotly>=5.18.0
 yfinance>=0.2.36
 requests>=2.31.0
+databento>=0.74.0
 fastapi>=0.110.0
 uvicorn>=0.27.0
 numba>=0.59.0

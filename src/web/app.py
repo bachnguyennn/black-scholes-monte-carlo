@@ -5,19 +5,35 @@ Architecture:
     src/web/tabs/
         tab_option_analysis.py  — Tab 1: Single option pricing & path simulation
         tab_scanner.py          — Tab 2: Live valuation gap scanner (async FastAPI)
-        tab_backtester.py       — Tab 3: Historical backtest (Heston / Jump Diffusion)
-        tab_portfolio_risk.py   — Tab 4: 3D Gamma/Vanna/Vega vectorized surfaces
+        tab_model_validation.py — Tab 3: Quote-based live model validation
+        tab_backtester.py       — Tab 4: Historical backtest (Heston / Jump Diffusion)
+        tab_portfolio_risk.py   — Tab 5: 3D Gamma/Vanna/Vega vectorized surfaces
 """
 
 import streamlit as st
 import sys
 import os
+from datetime import timezone
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
 
 from src.core.data_fetcher import get_market_data_runtime_summary, get_spot_and_vol
 from src.core.heston_model import feller_condition
-from src.web.tabs import tab_option_analysis, tab_scanner, tab_backtester, tab_portfolio_risk
+from src.web.tabs import tab_option_analysis, tab_scanner, tab_model_validation, tab_backtester, tab_portfolio_risk
+
+
+def _format_as_of_timestamp(value):
+    if value is None:
+        return "n/a"
+    try:
+        timestamp = value
+        if getattr(timestamp, "tzinfo", None) is None:
+            timestamp = timestamp.tz_localize(timezone.utc)
+        else:
+            timestamp = timestamp.tz_convert(timezone.utc)
+        return timestamp.strftime("%Y-%m-%d %H:%M UTC")
+    except Exception:
+        return str(value)
 
 # ============================================================================
 # PAGE CONFIG & CSS
@@ -97,7 +113,13 @@ def fetch_asset_data(symbol):
         'history': spot_data['history'],
         'name': spot_data['name'],
         'provider': spot_data.get('provider', 'yfinance'),
+        'requested_provider': spot_data.get('requested_provider', spot_data.get('provider', 'yfinance')),
+        'fallback_from': spot_data.get('fallback_from'),
         'provider_note': spot_data.get('provider_note', ''),
+        'as_of': spot_data.get('as_of'),
+        'history_points': int(spot_data.get('history_points', len(spot_data['history']))),
+        'is_stale': bool(spot_data.get('is_stale', False)),
+        'validation_warnings': list(spot_data.get('validation_warnings', [])),
     }
 
 
@@ -107,10 +129,34 @@ if asset_data:
     st.sidebar.success(f"Loaded: {asset_data['name']} ({asset_data.get('provider', 'yfinance')})")
     if asset_data.get('provider_note'):
         st.sidebar.caption(asset_data['provider_note'])
+    st.sidebar.markdown("**Data Source Status**")
+    st.sidebar.caption(
+        "  \n".join([
+            f"requested provider: `{asset_data.get('requested_provider', 'n/a')}`",
+            f"resolved provider: `{asset_data.get('provider', 'n/a')}`",
+            f"fallback active: `{'yes' if asset_data.get('fallback_from') else 'no'}`",
+            f"as-of timestamp: `{_format_as_of_timestamp(asset_data.get('as_of'))}`",
+            f"history points: `{asset_data.get('history_points', 0)}`",
+            f"stale flag: `{'yes' if asset_data.get('is_stale') else 'no'}`",
+        ])
+    )
+    if asset_data.get('validation_warnings'):
+        st.sidebar.warning("Validation warnings: " + " ".join(asset_data['validation_warnings']))
     default_spot = asset_data['price']
     default_vol = asset_data['vol']
 else:
     st.sidebar.warning("Using manual defaults.")
+    st.sidebar.markdown("**Data Source Status**")
+    st.sidebar.caption(
+        "  \n".join([
+            "requested provider: `n/a`",
+            "resolved provider: `manual`",
+            "fallback active: `n/a`",
+            "as-of timestamp: `n/a`",
+            "history points: `n/a`",
+            "stale flag: `n/a`",
+        ])
+    )
     default_spot = 100.0
     default_vol = 0.2
 
@@ -239,8 +285,8 @@ n_sims = st.sidebar.number_input("Simulations (N)", min_value=1000, max_value=10
 # TABS — delegate to modules
 # ============================================================================
 
-tab1, tab2, tab3, tab4 = st.tabs([
-    "Option Pricing", "Valuation Scanner", "Backtester", "Risk Surfaces"
+tab1, tab2, tab3, tab4, tab5 = st.tabs([
+    "Option Pricing", "Valuation Scanner", "Model Validation", "Backtester", "Risk Surfaces"
 ])
 
 with tab1:
@@ -263,6 +309,15 @@ with tab2:
     )
 
 with tab3:
+    tab_model_validation.render(
+        ticker=ticker, model_type=model_type,
+        default_vol=default_vol, n_sims=n_sims,
+        jump_intensity=jump_intensity, jump_mean=jump_mean, jump_std=jump_std,
+        heston_V0=heston_V0, heston_kappa=heston_kappa,
+        heston_theta=heston_theta, heston_xi=heston_xi, heston_rho=heston_rho
+    )
+
+with tab4:
     tab_backtester.render(
         ticker=ticker, option_type="call", n_sims=n_sims,
         jump_intensity=jump_intensity, jump_mean=jump_mean, jump_std=jump_std,
@@ -270,5 +325,5 @@ with tab3:
         heston_theta=heston_theta, heston_xi=heston_xi, heston_rho=heston_rho
     )
 
-with tab4:
-    tab_portfolio_risk.render(ticker=ticker, default_spot=default_spot)
+with tab5:
+    tab_portfolio_risk.render(ticker=ticker, default_spot=default_spot, asset_data=asset_data)
