@@ -27,4 +27,4 @@ htmlcov/
 docs/archive/
 docs/
 
-combined_options_data.csv
+*.csv
