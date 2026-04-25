@@ -204,7 +204,7 @@ def render(ticker, model_type, default_vol, n_sims,
 
     with scan_col3:
         st.markdown("**Scan Actions**")
-        scan_button = st.button("Run Scan", type="primary", use_container_width=True,
+        scan_button = st.button("Run Scan", type="primary", width="stretch",
             help="Run the pricing engine to rank valuation gaps across the selected expirations.")
 
     if not selected_exps:
@@ -221,12 +221,12 @@ def render(ticker, model_type, default_vol, n_sims,
         with cal_col1:
             st.markdown("**Heston Calibration**")
             st.caption("Fits κ, θ, ξ, ρ to the live implied volatility surface. Updates the sidebar parameters automatically.")
-            calibrate_button = st.button("Calibrate Heston to Market", use_container_width=True,
+            calibrate_button = st.button("Calibrate Heston to Market", width="stretch",
                 help="Fits the Heston stochastic-vol parameters to today's market implied volatility surface.")
         with cal_col2:
             st.markdown("**LSV Calibration**")
             st.caption("Builds a leverage function on top of Heston to better match the observed market surface.")
-            lsv_calibrate_button = st.button("Calibrate LSV Leverage Function", use_container_width=True,
+            lsv_calibrate_button = st.button("Calibrate LSV Leverage Function", width="stretch",
                 help="Derives the non-parametric leverage function L(S,t) from the market surface. Requires Heston calibration first.")
 
     # --- Execute Calibration ---
@@ -284,7 +284,7 @@ def render(ticker, model_type, default_vol, n_sims,
                     st.session_state['lsv_leverage_matrix'] = lsv_res['leverage_matrix']
                     st.session_state['lsv_strikes'] = lsv_res['strikes_grid']
                     st.session_state['lsv_maturities'] = lsv_res['maturities_grid']
-                    st.info("LSV parameters loaded. Select model 'Heston' and click 'Run Scan' to use the calibrated leverage function.")
+                    st.info("LSV parameters loaded. Select model 'LSV (Local Stochastic Vol)' and click 'Run Scan' to use the calibrated leverage function.")
                 else:
                     st.error(f"{lsv_res.get('message', 'Unknown error')}")
             else:
@@ -326,11 +326,12 @@ def render(ticker, model_type, default_vol, n_sims,
         model_map = {
             "Standard GBM": "gbm",
             "Jump Diffusion": "jump_diffusion",
-            "Heston (Stochastic Vol)": "heston"
+            "Heston (Stochastic Vol)": "heston",
+            "LSV (Local Stochastic Vol)": "lsv",
         }
         scan_model = model_map.get(model_type, "heston")
 
-        # Prepare LSV leverage if calibrated and model=='heston' (use LSV if calibrated)
+        # Prepare optional LSV leverage for explicit LSV model selection.
         lsv_leverage = None
         lsv_strikes = None
         lsv_mats = None
@@ -338,9 +339,6 @@ def render(ticker, model_type, default_vol, n_sims,
             lsv_leverage = st.session_state['lsv_leverage_matrix']
             lsv_strikes = st.session_state['lsv_strikes']
             lsv_mats = st.session_state['lsv_maturities']
-            # If LSV is calibrated and user is running Heston model, we'll use LSV leverage
-            if scan_model == 'heston':
-                scan_model = 'lsv'  # Use LSV with calibrated leverage
 
         payload = {
             "ticker": ticker, "r": r_live, "q": 0.0, "model": scan_model,
@@ -550,7 +548,7 @@ def render(ticker, model_type, default_vol, n_sims,
                 data=csv_data,
                 file_name=f"scan_results_{ticker}.csv",
                 mime="text/csv",
-                use_container_width=True
+                width="stretch"
             )
         with export_col3:
             json_data = filtered_df.to_json(orient="records", indent=2)
@@ -559,7 +557,7 @@ def render(ticker, model_type, default_vol, n_sims,
                 data=json_data,
                 file_name=f"scan_results_{ticker}.json",
                 mime="application/json",
-                use_container_width=True
+                width="stretch"
             )
 
         st.markdown("---")

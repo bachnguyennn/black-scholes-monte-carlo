@@ -2,8 +2,8 @@
 tab_backtester.py
 
 Tab 3 - Research Backtester
-Runs a controlled historical simulation using Jump Diffusion or Heston fair
-values against a synthetic market-price proxy. Outputs equity curve, trade
+Runs a controlled historical simulation using model fair
+values against historical option quotes. Outputs equity curve, trade
 log, and cost diagnostics with explicit methodology disclosure.
 """
 
@@ -16,7 +16,6 @@ from src.core.backtester import (
     get_historical_option_quote_range,
     has_historical_option_quotes,
     run_historical_quotes_backtest,
-    run_synthetic_backtest,
 )
 
 
@@ -36,75 +35,69 @@ def render(ticker, option_type, n_sims,
         2. **No Look-Ahead Bias**: Rolling volatility is computed strictly from observations before each trade date.
         3. **Data Source**:
            - **Historical SPX Quotes (CSV)** uses the pasted `combined_options_data.csv` bid/ask snapshots.
-           - **Synthetic Proxy** prices entry off a Black-Scholes proxy when historical option quotes are not replayed.
         4. **Interpretation**: Returns and Sharpe remain research metrics, especially because hedging is still simulated from daily closes.
 
         **Key Parameters**:
         - **Edge Threshold**: Minimum % difference between model fair value and market price to trigger trade entry
-        - **Historical CSV Mode**: Scans the full pasted SPX options file instead of asking for DTE targets
-        - **Model**: Choose between Heston (stochastic volatility) or Jump Diffusion (crash events)
+        - **Historical CSV Mode**: Scans the full pasted SPX options file
+        - **Model**: Choose between Heston, Jump Diffusion, or LSV fair-value engines
         """)
 
     st.markdown("---")
 
     historical_available = has_historical_option_quotes()
     supported_historical_ticker = str(ticker).upper() in {"SPX", "^SPX"}
-    source_options = ["Synthetic Proxy"]
-    if historical_available and supported_historical_ticker:
-        source_options.insert(0, "Historical SPX Quotes (CSV)")
-
-    bt_source = st.radio("Backtest Data Source", source_options, horizontal=True)
-    historical_mode = bt_source == "Historical SPX Quotes (CSV)"
     csv_start, csv_end = (None, None)
     if historical_available:
         csv_start, csv_end = get_historical_option_quote_range()
 
-    if historical_mode and csv_start and csv_end:
+    if historical_available and supported_historical_ticker and csv_start and csv_end:
         st.caption(
             f"Using the full local CSV range: {csv_start.strftime('%Y-%m-%d')} to {csv_end.strftime('%Y-%m-%d')}. "
             "This local file does not currently extend to 2023."
         )
     elif not historical_available:
-        st.caption("Historical quote mode is unavailable until `combined_options_data.csv` is present in the project root.")
+        st.error("Historical quote mode is unavailable until `combined_options_data.csv` is present in the project root.")
+        return
     elif not supported_historical_ticker:
-        st.caption("Historical quote mode currently supports SPX only. Other tickers fall back to the synthetic proxy.")
+        st.error("Historical quote mode currently supports SPX only (`SPX` / `^SPX`).")
+        return
 
     # --- Backtester Controls ---
     bt_col1, bt_col2, bt_col3, bt_col4 = st.columns([1, 1, 1.2, 1.2])
     with bt_col1:
         bt_capital = st.number_input("Capital ($)", value=10000.0, min_value=1000.0, step=1000.0)
     with bt_col2:
-        if historical_mode:
-            st.text_input("Period", value="Full CSV", disabled=True)
-            bt_period = FULL_HISTORICAL_PERIOD
-        else:
-            bt_period = st.selectbox("Period", ["1y", "2y", "3y", "5y"], index=1)
+        st.text_input("Period", value="Full CSV", disabled=True)
+        bt_period = FULL_HISTORICAL_PERIOD
     with bt_col3:
         bt_edge = st.number_input("Edge Threshold (%)", min_value=1, max_value=30, value=10, step=1)
     with bt_col4:
-        bt_model = st.selectbox("Model", ["jump_diffusion", "heston"])
-    if historical_mode:
-        st.text_input("Expiration Selection", value="Automatic scan across the full CSV", disabled=True)
-        bt_exps = None
-    else:
-        bt_exps = st.multiselect("Term Structure", [7, 14, 21, 30, 60, 90, 120, 150, 180], default=[30, 60, 90])
+        bt_model = st.selectbox("Model", ["jump_diffusion", "heston", "lsv"])
+    st.text_input("Expiration Selection", value="Automatic scan across the full CSV", disabled=True)
+    bt_exps = None
 
-    bt_button = st.button("RUN BACKTEST", type="primary", use_container_width=True)
+    bt_button = st.button("RUN BACKTEST", type="primary", width="stretch")
 
     st.markdown("---")
 
     if bt_button:
-        spinner_label = f"Backtesting {bt_model} on the full CSV for {ticker}..." if historical_mode else f"Backtesting {bt_model} over {bt_period} of {ticker}..."
+        spinner_label = f"Backtesting {bt_model} on the full CSV for {ticker}..."
         with st.spinner(spinner_label):
             try:
-                runner = run_historical_quotes_backtest if bt_source == "Historical SPX Quotes (CSV)" else run_synthetic_backtest
-                results = runner(
+                lsv_leverage = st.session_state.get("lsv_leverage_matrix")
+                lsv_strikes = st.session_state.get("lsv_strikes")
+                lsv_maturities = st.session_state.get("lsv_maturities")
+                results = run_historical_quotes_backtest(
                     ticker=ticker, period=bt_period, initial_capital=bt_capital,
                     option_type=option_type.lower(), edge_threshold=bt_edge / 100.0,
                     risk_free_rate=0.05, n_sims=n_sims, model=bt_model,
                     jump_intensity=jump_intensity, jump_mean=jump_mean, jump_std=jump_std,
                     heston_V0=heston_V0, heston_kappa=heston_kappa,
                     heston_theta=heston_theta, heston_xi=heston_xi, heston_rho=heston_rho,
+                    leverage_matrix=lsv_leverage,
+                    leverage_strikes=lsv_strikes,
+                    leverage_maturities=lsv_maturities,
                     expiry_days_list=bt_exps
                 )
             except Exception as e:
@@ -126,8 +119,6 @@ def render(ticker, option_type, n_sims,
                     f"spread <= {quote_filters.get('max_spread_pct', 0) * 100:.0f}% of mid, "
                     f"positive IV required."
                 )
-        else:
-            st.warning(disclosure or 'This backtest uses a synthetic market-price proxy rather than historical option quotes.')
 
         meta1, meta2, meta3 = st.columns(3)
         meta1.metric("Fair Value Model", methodology.get('fair_value_model', bt_model).upper())
@@ -208,7 +199,7 @@ def render(ticker, option_type, n_sims,
                     data=csv_data,
                     file_name=f"backtest_trades_{ticker}.csv",
                     mime="text/csv",
-                    use_container_width=True
+                    width="stretch"
                 )
             with export_col3:
                 json_data = trades_df.to_json(orient="records", indent=2)
@@ -217,7 +208,7 @@ def render(ticker, option_type, n_sims,
                     data=json_data,
                     file_name=f"backtest_trades_{ticker}.json",
                     mime="application/json",
-                    use_container_width=True
+                    width="stretch"
                 )
 
             # Detailed forensic view
@@ -226,10 +217,7 @@ def render(ticker, option_type, n_sims,
                 styled_trades = trades_df.style.map(_color_result, subset=['result'])
                 st.dataframe(styled_trades, width='stretch', hide_index=True)
         else:
-            if methodology.get('uses_historical_option_quotes', False):
-                st.info("No trades triggered. With SPX quote mode, the 100x contract multiplier, quote filters, and hedge reserve can make a small account ineligible even when edge exists.")
-            else:
-                st.info("No trades triggered. Try lowering the Edge Threshold.")
+            st.info("No trades triggered. With SPX quote mode, the 100x contract multiplier, quote filters, and hedge reserve can make a small account ineligible even when edge exists.")
 
         st.markdown("---")
         st.subheader("Cost Sensitivity Analysis")

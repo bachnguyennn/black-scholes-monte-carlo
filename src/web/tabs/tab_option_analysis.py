@@ -16,6 +16,7 @@ from src.core.black_scholes import black_scholes_price
 from src.core.gbm_engine import simulate_gbm
 from src.core.jump_diffusion import simulate_jump_diffusion, simulate_jump_diffusion_paths
 from src.core.heston_model import simulate_heston, simulate_heston_paths
+from src.core.lsv_model import simulate_lsv_paths
 from src.core.greeks import calculate_all_greeks
 
 
@@ -54,6 +55,8 @@ def render(ticker, asset_data, model_type, n_sims,
     bs_price = black_scholes_price(current_price, strike_price, time_to_maturity,
                                     risk_free_rate, volatility, option_type.lower())
 
+    lsv_surface_status = None
+
     if model_type == "Jump Diffusion":
         S_T, crash_mask = simulate_jump_diffusion(
             current_price, time_to_maturity, risk_free_rate, volatility, n_sims,
@@ -64,6 +67,27 @@ def render(ticker, asset_data, model_type, n_sims,
             current_price, time_to_maturity, risk_free_rate,
             heston_V0, heston_kappa, heston_theta, heston_xi, heston_rho, n_sims)
         crash_mask = np.zeros(n_sims, dtype=bool)
+    elif model_type == "LSV (Local Stochastic Vol)":
+        lsv_leverage = st.session_state.get("lsv_leverage_matrix")
+        lsv_strikes = st.session_state.get("lsv_strikes")
+        lsv_mats = st.session_state.get("lsv_maturities")
+        if lsv_leverage is None or lsv_strikes is None or lsv_mats is None:
+            lsv_surface_status = "Uncalibrated (L=1 fallback)"
+            lsv_leverage = np.ones((100, 100))
+            lsv_strikes = np.linspace(current_price * 0.5, current_price * 1.5, 100)
+            lsv_mats = np.linspace(0.01, max(time_to_maturity, 0.02), 100)
+        else:
+            lsv_surface_status = "Calibrated"
+
+        paths, _ = simulate_lsv_paths(
+            current_price, time_to_maturity, risk_free_rate,
+            heston_V0, heston_kappa, heston_theta, heston_xi, heston_rho,
+            lsv_leverage, lsv_strikes, lsv_mats,
+            n_paths=n_sims, n_steps=60
+        )
+        S_T = paths[:, -1]
+        crash_mask = np.zeros(n_sims, dtype=bool)
+        V_T = None
     else:
         S_T = simulate_gbm(current_price, time_to_maturity, risk_free_rate, volatility, n_sims)
         crash_mask = np.zeros(n_sims, dtype=bool)
@@ -80,7 +104,13 @@ def render(ticker, asset_data, model_type, n_sims,
     # --- Metrics Row ---
     m1, m2, m3, m4 = st.columns(4)
     m1.metric("Black-Scholes", f"${bs_price:.4f}")
-    m2.metric("Monte Carlo", f"${mc_price:.4f}", delta=f"{mc_price - bs_price:.4f}", delta_color="inverse")
+    model_metric_label = {
+        "Standard GBM": "GBM (MC)",
+        "Jump Diffusion": "Jump Diffusion (MC)",
+        "Heston (Stochastic Vol)": "Heston (MC)",
+        "LSV (Local Stochastic Vol)": "LSV (MC)",
+    }.get(model_type, f"{model_type} (MC)")
+    m2.metric(model_metric_label, f"${mc_price:.4f}", delta=f"{mc_price - bs_price:.4f}", delta_color="inverse")
     m3.metric("Std Error", f"+/-${std_error:.4f}")
     if model_type == "Jump Diffusion":
         cp = np.sum(crash_mask) / n_sims * 100
@@ -88,6 +118,8 @@ def render(ticker, asset_data, model_type, n_sims,
     elif model_type == "Heston (Stochastic Vol)" and V_T is not None:
         mean_vol = float(np.mean(np.sqrt(np.maximum(V_T, 0)))) * 100
         m4.metric("Terminal Vol", f"{mean_vol:.1f}%")
+    elif model_type == "LSV (Local Stochastic Vol)":
+        m4.metric("LSV Surface", "Calibrated" if lsv_surface_status == "Calibrated" else "Fallback")
     else:
         m4.metric("Model", "GBM")
 
@@ -106,6 +138,21 @@ def render(ticker, asset_data, model_type, n_sims,
             current_price, time_to_maturity, risk_free_rate,
             heston_V0, heston_kappa, heston_theta, heston_xi, heston_rho, n_plot_paths)
         path_crash_mask = np.zeros(n_plot_paths, dtype=bool)
+    elif model_type == "LSV (Local Stochastic Vol)":
+        lsv_leverage = st.session_state.get("lsv_leverage_matrix")
+        lsv_strikes = st.session_state.get("lsv_strikes")
+        lsv_mats = st.session_state.get("lsv_maturities")
+        if lsv_leverage is None or lsv_strikes is None or lsv_mats is None:
+            lsv_leverage = np.ones((100, 100))
+            lsv_strikes = np.linspace(current_price * 0.5, current_price * 1.5, 100)
+            lsv_mats = np.linspace(0.01, max(time_to_maturity, 0.02), 100)
+        sim_paths, _ = simulate_lsv_paths(
+            current_price, time_to_maturity, risk_free_rate,
+            heston_V0, heston_kappa, heston_theta, heston_xi, heston_rho,
+            lsv_leverage, lsv_strikes, lsv_mats,
+            n_paths=n_plot_paths, n_steps=60
+        )
+        path_crash_mask = np.zeros(n_plot_paths, dtype=bool)
     else:
         sim_paths = _simulate_gbm_paths(
             current_price, time_to_maturity, risk_free_rate, volatility, n_plot_paths)
@@ -121,7 +168,7 @@ def render(ticker, asset_data, model_type, n_sims,
             name='Historical', line=dict(color='#00FF00', width=2)))
 
     for i in range(n_plot_paths):
-        if model_type == "Heston (Stochastic Vol)":
+        if model_type in {"Heston (Stochastic Vol)", "LSV (Local Stochastic Vol)"}:
             color = 'rgba(255, 165, 0, 0.2)'
         elif path_crash_mask[i]:
             color = 'rgba(255, 50, 50, 0.3)'

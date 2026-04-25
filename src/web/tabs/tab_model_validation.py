@@ -124,7 +124,7 @@ def render(
 
     with ctl3:
         st.markdown("**Validation Run**")
-        run_button = st.button("Run Validation", type="primary", use_container_width=True)
+        run_button = st.button("Run Validation", type="primary", width="stretch")
 
     if not selected_exps:
         st.info("Select at least one live expiration to evaluate the model surface.")
@@ -152,17 +152,17 @@ def render(
         "Standard GBM": "gbm",
         "Jump Diffusion": "jump_diffusion",
         "Heston (Stochastic Vol)": "heston",
+        "LSV (Local Stochastic Vol)": "lsv",
     }
     eval_model = model_map.get(model_type, "heston")
 
     lsv_leverage = None
     lsv_strikes = None
     lsv_mats = None
-    if "lsv_leverage_matrix" in st.session_state and eval_model == "heston":
+    if "lsv_leverage_matrix" in st.session_state and eval_model == "lsv":
         lsv_leverage = st.session_state["lsv_leverage_matrix"]
         lsv_strikes = st.session_state["lsv_strikes"]
         lsv_mats = st.session_state["lsv_maturities"]
-        eval_model = "lsv"
 
     priced_df, diagnostics = scan_for_valuation_gaps(
         options_df,

@@ -144,6 +144,17 @@ The Greeks module uses JAX. If it is missing, reinstall dependencies inside the 
 pip install -r requirements.txt
 ```
 
+### Anaconda Python broken (`No module named 'encodings'`)
+
+If your Anaconda Python is broken (common after macOS updates), the venv symlinks will fail. Fix by recreating the venv with Homebrew Python:
+
+```bash
+rm -rf .venv
+/opt/homebrew/bin/python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+```
+
 ## 9. Suggested Pre-Push Checklist
 
 1. Confirm tests pass.

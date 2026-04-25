@@ -40,7 +40,7 @@ def _format_as_of_timestamp(value):
 # ============================================================================
 
 st.set_page_config(
-    page_title="MC Options Pricing Engine",
+    page_title="Quant Research Terminal V2",
     page_icon="",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -73,7 +73,7 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 st.markdown("""
-<h1 style='margin-bottom:0'>Monte Carlo Options Pricing Engine</h1>
+<h1 style='margin-bottom:0'>Quant Research Terminal V2</h1>
 <p style='color:#A0A0A0; margin-top:2px; font-size:0.9rem'>
 Black-Scholes &nbsp;|&nbsp; GBM Monte Carlo &nbsp;|&nbsp; Heston &nbsp;|&nbsp; Jump Diffusion &nbsp;|&nbsp; LSV
 </p>
@@ -84,8 +84,8 @@ Black-Scholes &nbsp;|&nbsp; GBM Monte Carlo &nbsp;|&nbsp; Heston &nbsp;|&nbsp; J
 # SIDEBAR — Shared State
 # ============================================================================
 
-st.sidebar.header("Asset Selection")
-ticker = st.sidebar.text_input("Ticker Symbol", value="^SPX",
+st.sidebar.header("1) Asset")
+ticker = st.sidebar.text_input("Ticker", value="^SPX",
     help="European-style S&P 500 workflow: prefer ^SPX. SPY, IVV, and VOO are ETF proxies with American-style exercise.").strip()
 
 if ticker.upper() in {"SPY", "IVV", "VOO"}:
@@ -95,11 +95,6 @@ elif ticker.upper() in {"^SPX", "SPX"}:
 
 market_data_summary = get_market_data_runtime_summary()
 st.sidebar.caption(f"Market data preference: `{market_data_summary['provider_preference']}`")
-st.sidebar.caption(market_data_summary["note"])
-if market_data_summary["provider_preference"] != "yfinance":
-    st.sidebar.caption(
-        "Options chains still use yfinance in this app because Polygon free/basic is only integrated for supported REST workflows."
-    )
 
 
 @st.cache_data(ttl=3600)
@@ -129,55 +124,53 @@ if asset_data:
     st.sidebar.success(f"Loaded: {asset_data['name']} ({asset_data.get('provider', 'yfinance')})")
     if asset_data.get('provider_note'):
         st.sidebar.caption(asset_data['provider_note'])
-    st.sidebar.markdown("**Data Source Status**")
-    st.sidebar.caption(
-        "  \n".join([
-            f"requested provider: `{asset_data.get('requested_provider', 'n/a')}`",
-            f"resolved provider: `{asset_data.get('provider', 'n/a')}`",
-            f"fallback active: `{'yes' if asset_data.get('fallback_from') else 'no'}`",
-            f"as-of timestamp: `{_format_as_of_timestamp(asset_data.get('as_of'))}`",
-            f"history points: `{asset_data.get('history_points', 0)}`",
-            f"stale flag: `{'yes' if asset_data.get('is_stale') else 'no'}`",
-        ])
-    )
+    with st.sidebar.expander("Data Source Details", expanded=False):
+        st.caption(market_data_summary["note"])
+        if market_data_summary["provider_preference"] != "yfinance":
+            st.caption(
+                "Options chains still use yfinance in this app because Polygon free/basic is only integrated for supported REST workflows."
+            )
+        st.caption(
+            "  \n".join([
+                f"requested provider: `{asset_data.get('requested_provider', 'n/a')}`",
+                f"resolved provider: `{asset_data.get('provider', 'n/a')}`",
+                f"fallback active: `{'yes' if asset_data.get('fallback_from') else 'no'}`",
+                f"as-of timestamp: `{_format_as_of_timestamp(asset_data.get('as_of'))}`",
+                f"history points: `{asset_data.get('history_points', 0)}`",
+                f"stale flag: `{'yes' if asset_data.get('is_stale') else 'no'}`",
+            ])
+        )
     if asset_data.get('validation_warnings'):
         st.sidebar.warning("Validation warnings: " + " ".join(asset_data['validation_warnings']))
     default_spot = asset_data['price']
     default_vol = asset_data['vol']
 else:
     st.sidebar.warning("Using manual defaults.")
-    st.sidebar.markdown("**Data Source Status**")
-    st.sidebar.caption(
-        "  \n".join([
-            "requested provider: `n/a`",
-            "resolved provider: `manual`",
-            "fallback active: `n/a`",
-            "as-of timestamp: `n/a`",
-            "history points: `n/a`",
-            "stale flag: `n/a`",
-        ])
-    )
+    with st.sidebar.expander("Data Source Details", expanded=False):
+        st.caption(market_data_summary["note"])
+        st.caption(
+            "  \n".join([
+                "requested provider: `n/a`",
+                "resolved provider: `manual`",
+                "fallback active: `n/a`",
+                "as-of timestamp: `n/a`",
+                "history points: `n/a`",
+                "stale flag: `n/a`",
+            ])
+        )
     default_spot = 100.0
     default_vol = 0.2
 
 st.sidebar.markdown("---")
-st.sidebar.header("Model Parameters")
+st.sidebar.header("2) Simulation Setup")
 
-model_type = st.sidebar.radio(
-    "Simulation Model",
-    ["Standard GBM", "Jump Diffusion", "Heston (Stochastic Vol)"],
-    help="GBM: Constant vol. Jump Diffusion: Crash events. Heston: Vol is random."
-)
+model_options = [
+    "Standard GBM",
+    "Jump Diffusion",
+    "Heston (Stochastic Vol)",
+    "LSV (Local Stochastic Vol)",
+]
 
-# --- Preset Model Configurations ---
-st.sidebar.markdown("**Quick Presets:**")
-preset = st.sidebar.selectbox(
-    "Load Configuration",
-    ["Custom", "GBM (Baseline)", "Jump Diffusion (2008 Crisis)", "Heston (Quarterly Earnings)", "LSV (Smile Capture)"],
-    help="Load predefined parameter sets for common scenarios"
-)
-
-# Apply preset if selected (updates session state for parameter inputs)
 preset_configs = {
     "GBM (Baseline)": {
         "model": "Standard GBM",
@@ -216,7 +209,7 @@ preset_configs = {
         "n_sims": 15000
     },
     "LSV (Smile Capture)": {
-        "model": "Heston (Stochastic Vol)",
+        "model": "LSV (Local Stochastic Vol)",
         "heston_V0": 0.04,
         "heston_kappa": 3.0,
         "heston_theta": 0.04,
@@ -229,29 +222,67 @@ preset_configs = {
     }
 }
 
-if preset != "Custom" and preset in preset_configs:
-    config = preset_configs[preset]
+# --- Explicit model selection + presets for defaults ---
+st.sidebar.markdown("**Quick Presets**")
+preset = st.sidebar.selectbox(
+    "Preset",
+    ["GBM (Baseline)", "Jump Diffusion (2008 Crisis)", "Heston (Quarterly Earnings)", "LSV (Smile Capture)"],
+    help="Loads suggested defaults for the selected model regime."
+)
+config = preset_configs[preset]
+if st.session_state.get("active_preset") != preset:
+    st.session_state["active_preset"] = preset
+    st.session_state["model_type"] = config["model"]
     st.session_state['heston_V0'] = config['heston_V0']
     st.session_state['heston_kappa'] = config['heston_kappa']
     st.session_state['heston_theta'] = config['heston_theta']
     st.session_state['heston_xi'] = config['heston_xi']
     st.session_state['heston_rho'] = config['heston_rho']
-    st.sidebar.success(f"Preset Loaded: {preset}")
+    st.session_state['jump_intensity'] = config['jump_intensity']
+    st.session_state['jump_mean_pct'] = int(round(config['jump_mean'] * 100))
+    st.session_state['jump_std_pct'] = int(round(config['jump_std'] * 100))
+    st.session_state['n_sims'] = int(config['n_sims'])
 
+if "model_type" not in st.session_state or st.session_state["model_type"] not in model_options:
+    st.session_state["model_type"] = "Standard GBM"
+
+model_type = st.sidebar.radio(
+    "Model",
+    model_options,
+    key="model_type",
+    help="LSV builds on Heston's stochastic variance process with a local leverage surface."
+)
+st.sidebar.caption(f"Active model: `{model_type}`")
 
 if model_type == "Jump Diffusion":
     with st.sidebar.expander("Crash Parameters", expanded=True):
-        jump_intensity = st.number_input("Crash Intensity (lambda)", min_value=0.0, max_value=1.0, value=0.1, step=0.05,
-                                        help="Probability of a crash event occurring per year")
-        jump_mean = st.number_input("Avg Crash Size (%)", min_value=-20, max_value=0, value=-5, step=1,
-                                   help="Average magnitude of crash (negative %)") / 100
-        jump_std = st.number_input("Crash Vol (%)", min_value=1, max_value=10, value=3, step=1,
-                                  help="Volatility of crash size (%)") / 100
+        jump_intensity = st.number_input(
+            "Crash Intensity (lambda)", min_value=0.0, max_value=1.0,
+            value=float(st.session_state.get("jump_intensity", config["jump_intensity"])),
+            step=0.05, key="jump_intensity",
+            help="Probability of a crash event occurring per year"
+        )
+        jump_mean_pct = st.number_input(
+            "Avg Crash Size (%)", min_value=-20, max_value=0,
+            value=int(st.session_state.get("jump_mean_pct", int(round(config["jump_mean"] * 100)))),
+            step=1, key="jump_mean_pct",
+            help="Average magnitude of crash (negative %)"
+        )
+        jump_std_pct = st.number_input(
+            "Crash Vol (%)", min_value=1, max_value=10,
+            value=int(st.session_state.get("jump_std_pct", int(round(config["jump_std"] * 100)))),
+            step=1, key="jump_std_pct",
+            help="Volatility of crash size (%)"
+        )
+        jump_mean = jump_mean_pct / 100
+        jump_std = jump_std_pct / 100
 else:
     jump_intensity, jump_mean, jump_std = 0.0, 0.0, 0.0
 
-if model_type == "Heston (Stochastic Vol)":
+if model_type in {"Heston (Stochastic Vol)", "LSV (Local Stochastic Vol)"}:
     with st.sidebar.expander("Heston Parameters", expanded=True):
+        if model_type == "LSV (Local Stochastic Vol)":
+            st.caption("LSV uses these Heston base parameters plus a leverage surface.")
         h_v0    = st.session_state.get('heston_V0',    round(default_vol**2, 4))
         h_kappa = st.session_state.get('heston_kappa', 2.0)
         h_theta = st.session_state.get('heston_theta', round(default_vol**2, 4))
@@ -279,7 +310,15 @@ else:
     heston_kappa, heston_theta, heston_xi, heston_rho = 2.0, default_vol**2, 0.3, -0.7
 
 st.sidebar.markdown("---")
-n_sims = st.sidebar.number_input("Simulations (N)", min_value=1000, max_value=100000, value=10000, step=1000)
+n_sims = st.sidebar.number_input(
+    "Monte Carlo Paths",
+    min_value=1000,
+    max_value=100000,
+    value=int(st.session_state.get("n_sims", config["n_sims"])),
+    step=1000,
+    key="n_sims",
+    help="Higher path count reduces Monte Carlo noise at the cost of runtime."
+)
 
 # ============================================================================
 # TABS — delegate to modules

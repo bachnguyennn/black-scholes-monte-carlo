@@ -3,11 +3,8 @@ backtester.py
 
 Research backtester for model-driven option trades.
 
-The engine avoids look-ahead bias in its volatility estimation and runs a
-daily delta-hedging routine, but it does not replay historical option
-quotes. Entry prices are proxied with Black-Scholes using no-look-ahead
-rolling volatility, so results should be presented as controlled research
-evidence rather than executable historical fills.
+Includes a historical quote mode using local SPX options bid/ask data and
+an older synthetic proxy mode retained for backward compatibility.
 """
 
 from functools import lru_cache
@@ -18,6 +15,7 @@ import pandas as pd
 import yfinance as yf
 from src.core.heston_model import price_option_heston_fourier
 from src.core.jump_diffusion import simulate_jump_diffusion
+from src.core.lsv_model import simulate_lsv_paths
 
 
 DEFAULT_HISTORICAL_OPTIONS_CSV = Path(__file__).resolve().parents[2] / "combined_options_data.csv"
@@ -305,6 +303,9 @@ def _price_and_delta(
     heston_theta,
     heston_xi,
     heston_rho,
+    leverage_matrix,
+    leverage_strikes,
+    leverage_maturities,
     dividend_yield,
     seed,
 ):
@@ -320,6 +321,33 @@ def _price_and_delta(
             heston_kappa, heston_theta, heston_xi, heston_rho, option_type, q=dividend_yield
         )
         return float(fair_p), float(delta_t)
+
+    if model == "lsv":
+        V0_est = sigma ** 2
+        if leverage_matrix is None or leverage_strikes is None or leverage_maturities is None:
+            lsv_leverage = np.ones((100, 100))
+            lsv_strikes = np.linspace(S * 0.5, S * 1.5, 100)
+            lsv_maturities = np.linspace(0.01, max(T, 0.02), 100)
+        else:
+            lsv_leverage = leverage_matrix
+            lsv_strikes = leverage_strikes
+            lsv_maturities = leverage_maturities
+
+        paths, _ = simulate_lsv_paths(
+            S, T, risk_free_rate, V0_est, heston_kappa, heston_theta, heston_xi, heston_rho,
+            lsv_leverage, lsv_strikes, lsv_maturities,
+            n_paths=n_sims, n_steps=50, q=dividend_yield, seed=int(seed) if seed is not None else -1
+        )
+        S_T = paths[:, -1]
+        payoffs = np.maximum(S_T - K, 0) if option_type == "call" else np.maximum(K - S_T, 0)
+        fair_p = float(np.exp(-risk_free_rate * T) * np.mean(payoffs))
+
+        # Use Heston delta as the hedge proxy for LSV to keep hedge costs stable.
+        delta_t = _approx_heston_delta(
+            S, K, T, risk_free_rate, V0_est,
+            heston_kappa, heston_theta, heston_xi, heston_rho, option_type, q=dividend_yield
+        )
+        return fair_p, float(delta_t)
 
     from scipy.stats import norm
 
@@ -365,6 +393,9 @@ def run_historical_quotes_backtest(
     heston_theta=0.04,
     heston_xi=0.3,
     heston_rho=-0.7,
+    leverage_matrix=None,
+    leverage_strikes=None,
+    leverage_maturities=None,
     expiry_days_list=None,
     tx_cost_bps=5.0,
     hedge_cost_bps=1.0,
@@ -521,6 +552,9 @@ def run_historical_quotes_backtest(
                 heston_theta=heston_theta,
                 heston_xi=heston_xi,
                 heston_rho=heston_rho,
+                leverage_matrix=leverage_matrix,
+                leverage_strikes=leverage_strikes,
+                leverage_maturities=leverage_maturities,
                 dividend_yield=dividend_yield,
                 seed=seed,
             )
@@ -591,6 +625,9 @@ def run_historical_quotes_backtest(
                         heston_theta=heston_theta,
                         heston_xi=heston_xi,
                         heston_rho=heston_rho,
+                        leverage_matrix=leverage_matrix,
+                        leverage_strikes=leverage_strikes,
+                        leverage_maturities=leverage_maturities,
                         dividend_yield=dividend_yield,
                         seed=seed,
                     )
@@ -876,7 +913,7 @@ def run_synthetic_backtest(
             from src.core.black_scholes import black_scholes_price
             try:
                 mkt_p = black_scholes_price(S0, K, T_initial, risk_free_rate, sigma, option_type, q=dividend_yield)
-            except:
+            except Exception:
                 mkt_p = fair_p
     
             # Relative pricing edge versus the proxy market price

@@ -161,7 +161,7 @@ def render(ticker, default_spot, asset_data=None):
         # Add refresh control
         refresh_col1, refresh_col2 = st.columns([3, 1])
         with refresh_col2:
-            if st.button("Refresh Data", use_container_width=True):
+            if st.button("Refresh Data", width="stretch"):
                 st.cache_data.clear()
                 st.rerun()
 
