@@ -1,0 +1,646 @@
+\documentclass[12pt,a4paper]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{float}
+\usepackage[style=apa,backend=biber]{biblatex}
+\usepackage{setspace}
+\usepackage{parskip}
+
+\addbibresource{references.bib}
+
+\lstset{
+  language=Python,
+  basicstyle=\ttfamily\small,
+  keywordstyle=\color{blue},
+  stringstyle=\color{red},
+  commentstyle=\color{gray},
+  frame=single,
+  breaklines=true
+}
+
+\hypersetup{colorlinks=true,linkcolor=blue,citecolor=blue,urlcolor=blue}
+\onehalfspacing
+
+\title{\textbf{Beyond Black-Scholes: A Multi-Model European Option Pricing Engine}}
+\author{IMCS 3020U --- Integrated Application Project II\\Ontario Tech University, Faculty of Science}
+\date{April 25, 2026}
+
+\begin{document}
+\maketitle
+\thispagestyle{empty}
+\newpage
+\setcounter{page}{1}
+
+\begin{abstract}
+This report presents the design, implementation, and evaluation of a Monte Carlo European option pricing engine that integrates four progressively sophisticated financial models: Black-Scholes-Merton (BSM), Geometric Brownian Motion (GBM) Monte Carlo, Heston Stochastic Volatility, Merton Jump Diffusion, and Local Stochastic Volatility (LSV). The system focuses exclusively on the pricing of European-style options---contracts that may only be exercised at expiration---which admit the closed-form and Monte Carlo solutions central to this work. The system demonstrates the synthesis of mathematical modelling and computer science by implementing each model's stochastic differential equations using vectorized numerical methods, wrapping them in an interactive Streamlit dashboard with a FastAPI backend, and validating them through convergence testing, calibration to live market data, and a delta-hedged backtesting framework. Live market data is sourced from Yahoo Finance via the yfinance library and the Polygon.io REST API, while historical backtesting uses end-of-day S\&P~500 Index (SPX) option quotes from the Chicago Board Options Exchange (CBOE) \parencite{singh2024}. The project illustrates how each successive model addresses specific limitations of its predecessor---constant volatility, absence of crash risk, and inability to fit observed implied volatility surfaces---while maintaining computational tractability through techniques such as Fourier-based analytical pricing and optional Numba JIT compilation.
+\end{abstract}
+
+\tableofcontents
+\newpage
+
+%======================================================================
+\section{Introduction}
+%======================================================================
+
+Options are financial derivatives whose value depends on an underlying asset's future price behaviour. This project focuses exclusively on \textbf{European-style options}---contracts that can only be exercised at the expiration date. This restriction is deliberate: European options admit closed-form analytical solutions \parencite{black1973,merton1973} and straightforward Monte Carlo estimation via terminal price distributions, making them the natural setting for comparing model accuracy. The foundational Black-Scholes-Merton (BSM) model provides an elegant closed-form solution under the assumption of constant volatility. However, empirical evidence consistently demonstrates that volatility is neither constant nor deterministic---markets exhibit volatility smiles, skews, and clustering that the BSM framework cannot reproduce \parencite{gatheral2006}.
+
+This project addresses that gap by implementing a progression of four European option pricing models, each relaxing a key assumption of its predecessor. The system is built as a usable research terminal---a web-based application that allows users to price European options, scan live markets for valuation discrepancies, validate model accuracy against observed quotes, and backtest model-driven trading strategies with realistic execution assumptions. The primary benchmark asset is the S\&P~500 Index (\texttt{\^{}SPX}), whose listed options are European-style, making it the ideal candidate for this framework.
+
+The project integrates core mathematical principles---stochastic calculus, partial differential equations, numerical integration, and statistical estimation---with modern software engineering practices including vectorized computation, asynchronous API design, and modular architecture. This integration of mathematics and computer science is the central objective of IMCS~3020U.
+
+%======================================================================
+\section{Background and Literature Review}
+%======================================================================
+
+\subsection{The Black-Scholes-Merton Framework}
+
+\textcite{black1973} derived a closed-form pricing formula for European options---options exercisable only at maturity---by assuming the underlying asset follows geometric Brownian motion (GBM) with constant drift and volatility. \textcite{merton1973} independently extended this framework with a rigorous treatment of continuous-time finance. The BSM formula expresses the price of a European call option as:
+\begin{equation}
+C = S_0 e^{-qT} N(d_1) - K e^{-rT} N(d_2)
+\end{equation}
+where
+\begin{equation}
+d_1 = \frac{\ln(S_0/K) + (r - q + \tfrac{1}{2}\sigma^2)T}{\sigma\sqrt{T}}, \quad d_2 = d_1 - \sigma\sqrt{T}
+\end{equation}
+
+Despite its theoretical elegance, the BSM model's constant-volatility assumption is violated in practice, as evidenced by the volatility smile phenomenon observed across all major options markets \parencite{hull2018}.
+
+\subsection{Monte Carlo Simulation in Finance}
+
+\textcite{glasserman2003} provides a comprehensive treatment of Monte Carlo methods in financial engineering. The core idea is to approximate the risk-neutral expectation $V_0 = e^{-rT}\mathbb{E}^{\mathbb{Q}}[\text{Payoff}(S_T)]$ by simulating a large number of terminal price scenarios and averaging the discounted payoffs.
+
+\subsection{Stochastic Volatility Models}
+
+\textcite{heston1993} proposed a stochastic volatility model in which the variance follows a Cox-Ingersoll-Ross (CIR) mean-reverting process. The model's key advantage is a semi-closed-form solution via Fourier inversion of the characteristic function, enabling efficient pricing without Monte Carlo simulation.
+
+\subsection{Jump Diffusion Models}
+
+\textcite{merton1976} extended the GBM framework by adding Poisson-distributed jump events to capture sudden, discontinuous price movements such as market crashes. The jump diffusion model produces heavier tails than GBM and can better price out-of-the-money put options.
+
+\subsection{Local Stochastic Volatility}
+
+\textcite{dupire1994} introduced the concept of local volatility---a deterministic function $\sigma(S, t)$ that reproduces all observed European option prices exactly. The Local Stochastic Volatility (LSV) framework combines Dupire's local volatility with Heston's stochastic variance process through a leverage function $L(S, t)$, achieving both the realistic dynamics of stochastic volatility and exact calibration to the market surface \parencite{gatheral2006}.
+
+\subsection{Discretization and Simulation Schemes}
+
+\textcite{andersen2008} developed efficient discretization schemes for the Heston model that preserve positivity of the variance process. The Feller condition $2\kappa\theta > \xi^2$ governs whether the variance process can reach zero; when violated, special numerical treatment is required.
+
+%======================================================================
+\section{Problem Definition}
+%======================================================================
+
+The core problem addressed by this project is: \textbf{How can progressively sophisticated mathematical models be implemented, validated, and deployed in an integrated system that demonstrates both theoretical understanding and practical computational competence?}
+
+Specifically, the project tackles three sub-problems:
+\begin{enumerate}
+\item \textbf{Model Implementation}: Translating the stochastic differential equations of four pricing models into efficient, numerically stable Python code.
+\item \textbf{Validation and Calibration}: Verifying that Monte Carlo simulations converge to known analytical solutions, and calibrating model parameters to live market data.
+\item \textbf{Practical Application}: Building a research terminal that applies these models to real-time market scanning, historical backtesting, and risk analysis.
+\end{enumerate}
+
+%======================================================================
+\section{Methodology}
+%======================================================================
+
+\subsection{Model Evolution Strategy}
+
+Each model is implemented as a self-contained module. All models price \textbf{European-style options exclusively}; early exercise is not supported. The progression is:
+\begin{enumerate}
+\item \textbf{BSM Analytical} $\rightarrow$ Baseline benchmark with closed-form European option solution
+\item \textbf{GBM Monte Carlo} $\rightarrow$ Validates Monte Carlo convergence to BSM for European payoffs
+\item \textbf{Heston Stochastic Volatility} $\rightarrow$ Addresses constant-volatility limitation
+\item \textbf{Merton Jump Diffusion} $\rightarrow$ Addresses absence of crash risk
+\item \textbf{LSV} $\rightarrow$ Addresses inability to fit observed volatility surfaces
+\end{enumerate}
+
+\subsection{Computational Approach}
+
+All simulations use vectorized NumPy operations to eliminate Python-level loops where possible. For models requiring path-level iteration (Heston, Jump Diffusion), optional Numba JIT compilation is employed to achieve near-C performance. The Heston model additionally implements Fourier-based analytical pricing for high-throughput scanning (${\sim}5$\,ms per option versus ${\sim}500$\,ms for Monte Carlo).
+
+\subsection{Data Sources}
+
+The system integrates multiple market data sources, summarized in Table~\ref{tab:datasources}.
+
+\begin{table}[H]
+\centering
+\caption{Market data sources used in the system.}
+\label{tab:datasources}
+\begin{tabular}{@{}lll@{}}
+\toprule
+\textbf{Source} & \textbf{Data Type} & \textbf{Usage} \\
+\midrule
+Yahoo Finance & Spot, closes, options chains, IVs & Primary live feed \parencite{yahoo} \\
+Polygon.io API & Spot, daily closes, metadata & Secondary/fallback \parencite{polygon} \\
+S\&P 500 Options (Kaggle) & EOD bid/ask, IV, Greeks, volume & Historical backtester \parencite{singh2024} \\
+U.S.\ T-Bills (\texttt{\^{}IRX}) & 13-week yield & Risk-free rate proxy \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Historical backtesting uses the ``S\&P~500 Daily Options Data (2010--2023)'' dataset published on Kaggle by \textcite{singh2024}, which contains CBOE end-of-day SPX option quote snapshots including bid, ask, implied volatility, delta, and volume fields across approximately 13 years of trading history.
+
+\subsection{Validation Framework}
+
+Model correctness is verified through:
+\begin{itemize}
+\item \textbf{Convergence tests}: Monte Carlo prices must converge to BSM analytical European option prices as path count increases.
+\item \textbf{Statistical tests}: Terminal price distributions are tested against theoretical moments.
+\item \textbf{Calibration}: Heston parameters are fitted to live implied volatility surfaces using constrained optimization (SLSQP).
+\item \textbf{Backtesting}: Model-driven trading strategies are tested against historical data with realistic execution assumptions.
+\end{itemize}
+
+%======================================================================
+\section{System Architecture and Implementation}
+%======================================================================
+
+\subsection{Technology Stack}
+
+The system is implemented in Python~3.12+ using the libraries in Table~\ref{tab:techstack}.
+
+\begin{table}[H]
+\centering
+\caption{Technology stack.}
+\label{tab:techstack}
+\begin{tabular}{@{}lll@{}}
+\toprule
+\textbf{Component} & \textbf{Technology} & \textbf{Purpose} \\
+\midrule
+Numerical Engine & NumPy $\geq$1.26, SciPy $\geq$1.11 & Vectorized simulation \\
+JIT Compilation & Numba (optional) & Near-C loop performance \\
+Auto-Differentiation & JAX (optional) & Exact Greeks via AD \\
+Web Frontend & Streamlit $\geq$1.30 & Interactive dashboard \\
+API Backend & FastAPI & Async scanning endpoint \\
+Visualization & Plotly $\geq$5.18 & Interactive 3D surfaces \\
+Market Data & yfinance, Polygon.io & Live European options chains \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Module Architecture}
+
+The codebase is organized into three layers:
+\begin{lstlisting}[language={},caption={Project structure.}]
+src/
+  core/                    # Mathematical engine
+    black_scholes.py       gbm_engine.py
+    heston_model.py        jump_diffusion.py
+    lsv_model.py           greeks.py
+    calibration_engine.py  scanner_engine.py
+    backtester.py          model_evaluation.py
+    data_fetcher.py        config.py
+  api/main.py              # FastAPI backend
+  web/app.py               # Streamlit frontend
+  web/tabs/                # Five analysis tab modules
+\end{lstlisting}
+
+\subsection{Frontend Design}
+
+The Streamlit dashboard provides five analysis tabs:
+\begin{enumerate}
+\item \textbf{Option Pricing}: Single-option pricing with path visualization and probability metrics.
+\item \textbf{Valuation Scanner}: Live market scanning for model-versus-market valuation gaps.
+\item \textbf{Model Validation}: Quote-based live model fit diagnostics (MAE, RMSE, NBBO coverage).
+\item \textbf{Backtester}: Historical delta-hedged strategy backtesting with cost sensitivity analysis.
+\item \textbf{Risk Surfaces}: 3D vectorized Greek surfaces (Gamma, Vega) across spot and volatility.
+\end{enumerate}
+
+%======================================================================
+\section{Mathematical Models}
+%======================================================================
+
+All models share the same risk-neutral pricing principle. The fair value of a European option at time $t=0$ is the discounted expected payoff under the risk-neutral measure $\mathbb{Q}$:
+\begin{equation}
+V_0 = e^{-rT}\,\mathbb{E}^{\mathbb{Q}}\bigl[\text{Payoff}(S_T)\bigr]
+\end{equation}
+For a European call and put, respectively:
+\begin{equation}
+\text{Call Payoff} = \max(S_T - K,\, 0), \qquad \text{Put Payoff} = \max(K - S_T,\, 0)
+\end{equation}
+The models differ in how the terminal distribution of $S_T$ is specified.
+
+%----------------------------------------------------------------------
+\subsection{Black-Scholes-Merton}
+%----------------------------------------------------------------------
+
+The BSM model prices \textbf{European options} by assuming the asset follows GBM under the risk-neutral measure:
+\begin{equation}
+dS_t = (r - q)S_t\,dt + \sigma S_t\,dW_t
+\end{equation}
+where $r$ is the risk-free rate, $q$ is the continuous dividend yield, $\sigma$ is the constant volatility, and $W_t$ is a standard Brownian motion.
+
+The exact solution for terminal price is:
+\begin{equation}
+S_T = S_0 \exp\!\left((r - q - \tfrac{1}{2}\sigma^2)T + \sigma\sqrt{T}\,Z\right), \quad Z \sim N(0,1)
+\end{equation}
+
+The closed-form European call price is:
+\begin{equation}
+\label{eq:bsm-call}
+C = S_0\,e^{-qT}\,N(d_1) - K\,e^{-rT}\,N(d_2)
+\end{equation}
+The corresponding European put price, obtained via put-call parity, is:
+\begin{equation}
+\label{eq:bsm-put}
+P = K\,e^{-rT}\,N(-d_2) - S_0\,e^{-qT}\,N(-d_1)
+\end{equation}
+where $N(\cdot)$ denotes the standard normal CDF and
+\begin{equation}
+d_1 = \frac{\ln(S_0/K) + (r - q + \tfrac{1}{2}\sigma^2)T}{\sigma\sqrt{T}}, \qquad d_2 = d_1 - \sigma\sqrt{T}
+\end{equation}
+
+The formula is valid exclusively for European options; American-style early exercise is not modelled.
+
+%----------------------------------------------------------------------
+\subsection{GBM Monte Carlo Engine}
+%----------------------------------------------------------------------
+
+The GBM engine generates $N$ terminal prices using the exact GBM solution and estimates the European call price as:
+\begin{equation}
+\hat{C}_0 = e^{-rT} \frac{1}{N}\sum_{i=1}^{N}\max\!\bigl(S_T^{(i)} - K,\, 0\bigr)
+\end{equation}
+For puts, $\max(K - S_T^{(i)}, 0)$ replaces the call payoff. The Monte Carlo standard error is:
+\begin{equation}
+\text{SE} = \frac{\hat{\sigma}_{\text{payoff}}}{\sqrt{N}}
+\end{equation}
+where $\hat{\sigma}_{\text{payoff}}$ is the sample standard deviation of the discounted payoffs. This confirms convergence at rate $O(N^{-1/2})$, independent of dimensionality.
+
+Because European options depend only on the terminal price $S_T$ and not on the path taken, the simulation need only generate $S_T$ values directly---full path simulation is provided separately for visualization purposes.
+
+%----------------------------------------------------------------------
+\subsection{Heston Stochastic Volatility}
+%----------------------------------------------------------------------
+
+The Heston model \parencite{heston1993} evolves two coupled SDEs:
+\begin{align}
+dS_t &= (r - q)S_t\,dt + \sqrt{V_t}\,S_t\,dW_t^S \label{eq:heston-s}\\
+dV_t &= \kappa(\theta - V_t)\,dt + \xi\sqrt{V_t}\,dW_t^V \label{eq:heston-v}\\
+\text{Corr}&(dW_t^S, dW_t^V) = \rho \label{eq:heston-corr}
+\end{align}
+The five parameters are: $V_0$ (initial variance), $\kappa$ (mean-reversion speed), $\theta$ (long-run variance), $\xi$ (volatility of volatility), and $\rho$ (spot-variance correlation).
+
+\paragraph{Monte Carlo Discretization.}
+The Euler-Maruyama scheme with full truncation discretizes Eqs.~\eqref{eq:heston-s}--\eqref{eq:heston-v} over time step $\Delta t$:
+\begin{align}
+V_{t+\Delta t}^{+} &= \max(V_t,\, 0) \label{eq:heston-trunc}\\
+V_{t+\Delta t} &= V_t + \kappa(\theta - V_{t+\Delta t}^{+})\,\Delta t + \xi\sqrt{V_{t+\Delta t}^{+}\,\Delta t}\;Z_t^V \label{eq:heston-euler-v}\\
+\ln S_{t+\Delta t} &= \ln S_t + \bigl(r - q - \tfrac{1}{2}V_{t+\Delta t}^{+}\bigr)\Delta t + \sqrt{V_{t+\Delta t}^{+}\,\Delta t}\;Z_t^S \label{eq:heston-euler-s}
+\end{align}
+Correlated normals are generated via Cholesky decomposition:
+\begin{equation}
+Z^V = \rho\,Z^S + \sqrt{1-\rho^2}\;Z^{\perp}, \qquad Z^S,\,Z^{\perp} \stackrel{\text{iid}}{\sim} N(0,1)
+\end{equation}
+
+\paragraph{Fourier Analytical Pricing.}
+The semi-closed-form solution prices the call via the characteristic function $\phi_j(u)$ \parencite{heston1993}:
+\begin{equation}
+C = S_0\,e^{-qT}P_1 - K\,e^{-rT}P_2
+\end{equation}
+where the exercise probabilities are recovered by Fourier inversion:
+\begin{equation}
+P_j = \frac{1}{2} + \frac{1}{\pi}\int_0^{\infty}\text{Re}\!\left[\frac{e^{-iu\ln K}\,\phi_j(u)}{iu}\right]du, \qquad j=1,2
+\end{equation}
+The Heston characteristic function for $j=1,2$ is:
+\begin{equation}
+\phi_j(u) = \exp\!\bigl[C_j(u,T) + D_j(u,T)V_0 + iu\ln S_0\bigr]
+\end{equation}
+where:
+\begin{align}
+C_j &= (r-q)\,iu\,T + \frac{\kappa\theta}{\xi^2}\Bigl[(b_j - \rho\xi\,iu + d_j)T - 2\ln\frac{1 - g_j e^{d_j T}}{1 - g_j}\Bigr] \\
+D_j &= \frac{b_j - \rho\xi\,iu + d_j}{\xi^2}\cdot\frac{1 - e^{d_j T}}{1 - g_j e^{d_j T}} \\
+d_j &= \sqrt{(\rho\xi\,iu - b_j)^2 - \xi^2(2u_j\,iu - u^2)} \\
+g_j &= \frac{b_j - \rho\xi\,iu + d_j}{b_j - \rho\xi\,iu - d_j}
+\end{align}
+with $u_1 = \tfrac{1}{2}$, $u_2 = -\tfrac{1}{2}$, $b_1 = \kappa - \rho\xi$, $b_2 = \kappa$.
+
+\paragraph{Feller Condition.}
+The variance process remains strictly positive when $2\kappa\theta > \xi^2$. The implementation explicitly checks this condition and surfaces the result in the UI.
+
+%----------------------------------------------------------------------
+\subsection{Merton Jump Diffusion}
+%----------------------------------------------------------------------
+
+The Jump Diffusion model \parencite{merton1976} extends GBM with compound Poisson jump arrivals:
+\begin{equation}
+dS_t = (r - q - \lambda\kappa_J)S_t\,dt + \sigma S_t\,dW_t + (e^Y - 1)S_t\,dN_t
+\end{equation}
+where $N_t \sim \text{Poisson}(\lambda)$ is the jump counting process with intensity $\lambda$ (expected jumps per year), $Y \sim N(\mu_J, \sigma_J^2)$ is the log-jump size, and the risk-neutral jump compensator is:
+\begin{equation}
+\kappa_J = e^{\mu_J + \frac{1}{2}\sigma_J^2} - 1
+\end{equation}
+The compensator ensures the drift-adjusted process is a martingale under $\mathbb{Q}$.
+
+\paragraph{Discrete Simulation.}
+Over each time step $\Delta t$, the number of jumps $J_t \sim \text{Poisson}(\lambda \Delta t)$ is drawn, and the cumulative jump magnitude is $\sum_{j=1}^{J_t} Y_j$ where each $Y_j \sim N(\mu_J, \sigma_J^2)$. The log-price update is:
+\begin{equation}
+\ln S_{t+\Delta t} = \ln S_t + \bigl(r - q - \tfrac{1}{2}\sigma^2 - \lambda\kappa_J\bigr)\Delta t + \sigma\sqrt{\Delta t}\,Z_t + \sum_{j=1}^{J_t} Y_j
+\end{equation}
+
+%----------------------------------------------------------------------
+\subsection{Local Stochastic Volatility}
+%----------------------------------------------------------------------
+
+The LSV model \parencite{gatheral2006} modulates the Heston process with a leverage function:
+\begin{equation}
+dS_t = (r - q)S_t\,dt + L(S_t, t)\sqrt{V_t}\,S_t\,dW_t^S
+\end{equation}
+
+The leverage function $L(K, T)$ is calibrated from the Dupire local variance surface:
+\begin{equation}
+\sigma_{\text{loc}}^2 = \frac{\partial w/\partial T}{1 - \frac{k}{w}\frac{\partial w}{\partial k} + \frac{1}{4}\!\left(-\frac{1}{4} - \frac{1}{w} + \frac{k^2}{w^2}\right)\!\left(\frac{\partial w}{\partial k}\right)^{\!2} + \frac{1}{2}\frac{\partial^2 w}{\partial k^2}}
+\end{equation}
+where $w(k, T) = \sigma_{IV}^2\,T$ is total implied variance, $k = \ln(K/F)$ is log-moneyness, and $F = S_0\,e^{(r-q)T}$ is the forward price of the underlying \parencite{gatheral2006}.
+
+The leverage function bridges local and stochastic volatility:
+\begin{equation}
+L(K, T) = \sqrt{\frac{\sigma_{\text{loc}}^2(K, T)}{\mathbb{E}[V_t]}}
+\end{equation}
+where $\mathbb{E}[V_t] = \theta + (V_0 - \theta)e^{-\kappa t}$ is the analytic Heston expected variance. When the Heston model already fits the surface perfectly, $L \equiv 1$; deviations from unity quantify the leverage correction needed.
+
+%======================================================================
+\section{Computational Methods}
+%======================================================================
+
+\subsection{Vectorized Simulation}
+
+All math is vectorized using NumPy. For example, the GBM terminal price simulation generates all $N$ paths in three vectorized operations:
+\begin{lstlisting}
+Z = np.random.randn(n_sims)
+drift = (r - 0.5 * sigma**2) * T
+S_T = S0 * np.exp(drift + sigma * np.sqrt(T) * Z)
+\end{lstlisting}
+
+\subsection{JIT Compilation}
+
+For models requiring path-level iteration, the \texttt{@njit(fastmath=True)} decorator from Numba compiles Python functions to optimized machine code. A graceful fallback ensures the system operates without Numba installed.
+
+\subsection{Automatic Differentiation for Greeks}
+
+The option Greeks---sensitivities of the option price to input parameters---are computed using JAX automatic differentiation when available:
+\begin{lstlisting}
+_jax_delta = jax.jit(jax.grad(bs_price_jax, argnums=0))
+_jax_gamma = jax.jit(jax.grad(jax.grad(bs_price_jax, argnums=0), argnums=0))
+\end{lstlisting}
+
+The BSM analytical Greeks are:
+\begin{align}
+\Delta_{\text{call}} &= e^{-qT}N(d_1), \qquad \Delta_{\text{put}} = -e^{-qT}N(-d_1) \label{eq:delta}\\
+\Gamma &= \frac{e^{-qT}\,n(d_1)}{S_0\,\sigma\sqrt{T}} \label{eq:gamma}\\
+\mathcal{V} &= S_0\,e^{-qT}\,n(d_1)\,\sqrt{T} \label{eq:vega}\\
+\Theta_{\text{call}} &= -\frac{S_0\,e^{-qT}\,n(d_1)\,\sigma}{2\sqrt{T}} - rKe^{-rT}N(d_2) + qS_0 e^{-qT}N(d_1) \label{eq:theta}
+\end{align}
+where $n(\cdot)$ is the standard normal PDF. For models without closed-form Greeks, the system falls back to central finite differences:
+\begin{equation}
+\Delta \approx \frac{V(S_0 + h) - V(S_0 - h)}{2h}, \qquad \Gamma \approx \frac{V(S_0 + h) - 2V(S_0) + V(S_0 - h)}{h^2}
+\end{equation}
+
+\subsection{Numerical Integration}
+
+The Heston Fourier pricer uses \texttt{scipy.integrate.quad} for numerical integration of the characteristic function over the domain $[10^{-4}, 200]$ with adaptive error control (\texttt{epsabs}$=10^{-6}$, \texttt{limit}$=100$).
+
+\subsection{Constrained Optimization}
+
+Heston calibration uses \texttt{scipy.optimize.minimize} with the SLSQP method and parameter bounds ($\kappa > 0$, $\theta > 0$, $\xi > 0$, $-1 < \rho < 0$, $V_0 > 0$). The objective function is:
+\begin{equation}
+\label{eq:calib-sse}
+\text{SSE}(\boldsymbol{\Phi}) = \sum_{i=1}^{M} w_i \bigl(\sigma_{IV,i}^{\text{market}} - \sigma_{IV,i}^{\text{model}}(\boldsymbol{\Phi})\bigr)^2
+\end{equation}
+where $\boldsymbol{\Phi} = (\kappa, \theta, \xi, \rho, V_0)$, $M$ is the number of liquid contracts, and ATM-centered Gaussian weights $w_i$ are applied to emphasize near-the-money options.
+
+%======================================================================
+\section{Calibration and Validation}
+%======================================================================
+
+\subsection{Convergence Testing}
+
+The test suite verifies that GBM Monte Carlo prices converge to BSM analytical prices. At $N = 100{,}000$ paths, the standard error is consistently below $0.01$ for typical parameter configurations, confirming correct implementation.
+
+\subsection{Heston Calibration Pipeline}
+
+The calibration engine performs the following steps:
+\begin{enumerate}
+\item Filter the options chain to liquid, near-the-money contracts (80\%--120\% moneyness).
+\item Extract market implied volatilities and apply Gaussian ATM-centered weights.
+\item For each parameter vector $(\kappa, \theta, \xi, \rho, V_0)$, price all contracts via Fourier inversion.
+\item Back-solve model implied volatilities via binary search on BSM.
+\item Minimize weighted SSE using SLSQP with 500-iteration budget.
+\end{enumerate}
+
+\subsection{IV Surface Construction}
+
+The \texttt{build\_iv\_surface} function interpolates scattered options chain data onto a regular $(K \times T)$ grid using \texttt{scipy.interpolate.griddata} with a fallback chain (linear $\rightarrow$ nearest). Gaussian smoothing ($\sigma = 0.5$) stabilizes the surface.
+
+\subsection{Live Model Validation}
+
+The model evaluation module computes quote-based fit metrics:
+\begin{itemize}
+\item \textbf{Price MAE/RMSE} versus quoted midpoint
+\item \textbf{IV MAE} versus quoted market implied volatility
+\item \textbf{NBBO coverage}: percentage of model prices falling within the bid-ask spread
+\item \textbf{Spread-normalized error}: model error expressed in units of the quoted spread
+\end{itemize}
+
+\subsection{Backtesting Framework}
+
+The backtester provides two modes:
+\begin{enumerate}
+\item \textbf{Historical Quote Mode}: Uses actual SPX option bid/ask data from CSV, with real market execution prices and the 100$\times$ contract multiplier.
+\item \textbf{Synthetic Proxy Mode}: Uses BSM-proxy entry prices derived from rolling historical volatility.
+\end{enumerate}
+
+Both modes enforce: no look-ahead bias (with assertion guard), daily delta hedging, transaction costs (entry 5\,bps, hedge 1\,bps, slippage 1\%), cost sensitivity analysis (0.5$\times$, 1.0$\times$, 1.5$\times$ multipliers), and explicit methodology disclosure in the output.
+
+%======================================================================
+\section{Results}
+%======================================================================
+
+All experiments use a common ATM European call configuration: $S_0 = 100$, $K = 100$, $T = 1$\,yr, $r = 0.05$, $q = 0$.
+
+\subsection{BSM Analytical Benchmark}
+
+The BSM analytical engine produces the following reference prices under $\sigma = 0.20$:
+\begin{itemize}
+\item Call Price: $C = 10.4506$
+\item Put Price: $P = 5.5735$
+\item Put-Call Parity verification: $C - P = 4.8771 = S_0 - Ke^{-rT}$ \checkmark
+\end{itemize}
+
+\subsection{GBM Monte Carlo Convergence}
+
+Table~\ref{tab:convergence} confirms that Monte Carlo prices converge to the BSM analytical value at the expected $O(N^{-1/2})$ rate.
+
+\begin{table}[H]
+\centering
+\caption{GBM Monte Carlo convergence to BSM ($C_{\text{BSM}} = 10.4506$, $\sigma = 0.20$).}
+\label{tab:convergence}
+\begin{tabular}{@{}rrrrr@{}}
+\toprule
+$N$ paths & MC Price & Std Error & $|$Error$|$ & Time (s) \\
+\midrule
+1{,}000      & 10.5166 & 0.4727 & 0.0660 & 0.0003 \\
+5{,}000      & 10.4850 & 0.2075 & 0.0344 & 0.0001 \\
+10{,}000     & 10.4502 & 0.1478 & 0.0004 & 0.0002 \\
+50{,}000     & 10.4462 & 0.0657 & 0.0044 & 0.0022 \\
+100{,}000    & 10.4739 & 0.0466 & 0.0233 & 0.0024 \\
+500{,}000    & 10.4413 & 0.0208 & 0.0093 & 0.0135 \\
+1{,}000{,}000 & 10.4342 & 0.0147 & 0.0164 & 0.0278 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+At $N = 1{,}000{,}000$ paths, the standard error of $0.0147$ is well within the $1/\sqrt{N}$ rate, and the absolute error of $0.0164$ is consistent with the $95\%$ confidence interval $\pm 2 \times 0.0147 = \pm 0.0294$.
+
+\subsection{Heston Model Validation}
+
+The Heston model was tested with parameters $\kappa = 2.0$, $\theta = 0.04$, $\xi = 0.3$, $\rho = -0.7$, $V_0 = 0.04$. The Feller condition is satisfied: $2\kappa\theta = 0.16 > \xi^2 = 0.09$.
+
+\begin{table}[H]
+\centering
+\caption{Heston pricing: Fourier vs.\ Monte Carlo ($C_{\text{Fourier}} = 10.3941$).}
+\label{tab:heston}
+\begin{tabular}{@{}lrrrr@{}}
+\toprule
+Method & Price & $\pm$ SE & $|$Error vs.\ Fourier$|$ & Time \\
+\midrule
+Fourier analytical & 10.3941 & --- & --- & 0.64\,ms \\
+MC ($N=10{,}000$)  & 10.1947 & 0.1212 & 0.1994 & 4.39\,s \\
+MC ($N=50{,}000$)  & 10.3776 & 0.0546 & 0.0165 & 21.99\,s \\
+MC ($N=100{,}000$) & 10.3799 & 0.0386 & 0.0142 & 44.06\,s \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The Heston call price of $10.3941$ is lower than the BSM call price of $10.4506$ (difference: $-0.0565$), which is consistent with the negative spot-variance correlation $\rho = -0.7$ producing left skew that reduces ATM call values relative to the symmetric BSM distribution.
+
+\subsection{Jump Diffusion Results}
+
+The Merton Jump Diffusion model was tested with $\lambda = 0.1$, $\mu_J = -0.05$, $\sigma_J = 0.10$, yielding a jump compensator $\kappa_J = -0.0440$.
+
+\begin{table}[H]
+\centering
+\caption{Merton Jump Diffusion Monte Carlo pricing ($\sigma = 0.20$, $\lambda = 0.1$).}
+\label{tab:jd}
+\begin{tabular}{@{}rrrr@{}}
+\toprule
+$N$ paths & MC Price & $\pm$ SE & Time (s) \\
+\midrule
+10{,}000  & 10.4716 & 0.1490 & 2.54 \\
+50{,}000  & 10.5452 & 0.0668 & 12.70 \\
+100{,}000 & 10.4923 & 0.0470 & 25.06 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The Jump Diffusion call price is slightly higher than BSM due to the additional variance from the jump component, which increases the expected value of $\max(S_T - K, 0)$ despite the negative mean jump size.
+
+\subsection{BSM Greeks}
+
+Table~\ref{tab:greeks} reports the BSM Greeks for the ATM European call.
+
+\begin{table}[H]
+\centering
+\caption{BSM Greeks ($S_0 = 100$, $K = 100$, $T = 1$, $r = 0.05$, $\sigma = 0.20$).}
+\label{tab:greeks}
+\begin{tabular}{@{}lr@{}}
+\toprule
+Greek & Value \\
+\midrule
+$\Delta$ (Delta)  & $+0.6368$ \\
+$\Gamma$ (Gamma)  & $+0.0188$ \\
+$\mathcal{V}$ (Vega) & $+0.3752$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Performance Benchmarks}
+
+Table~\ref{tab:bench} compares the execution times of each pricing engine for $N = 100{,}000$ paths (252 time steps for path-dependent models).
+
+\begin{table}[H]
+\centering
+\caption{Execution time comparison ($N = 100{,}000$ paths).}
+\label{tab:bench}
+\begin{tabular}{@{}lrr@{}}
+\toprule
+Engine & Time & Speedup vs.\ Heston MC \\
+\midrule
+GBM (vectorized, terminal only) & 2.70\,ms & $16{,}276\times$ \\
+Heston Fourier (single option) & 0.58\,ms & $75{,}335\times$ \\
+Jump Diffusion MC (252 steps) & 24{,}813\,ms & $1.8\times$ \\
+Heston MC (252 steps) & 44{,}017\,ms & $1.0\times$ (baseline) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+GBM's vectorized terminal-price generation is ${\sim}16{,}000\times$ faster than Heston MC because it requires no time-stepping. The Heston Fourier pricer is ${\sim}75{,}000\times$ faster than Heston MC, which is why it is used for the scanner's batch pricing workflow.
+
+\subsection{Terminal Distribution Moments}
+
+Table~\ref{tab:moments} compares the statistical moments of the log-return distributions generated by GBM and Jump Diffusion against theoretical expectations.
+
+\begin{table}[H]
+\centering
+\caption{Terminal log-return distribution moments ($N = 100{,}000$, $T = 1$).}
+\label{tab:moments}
+\begin{tabular}{@{}lrrr@{}}
+\toprule
+Statistic & GBM & Jump Diffusion & Theory (GBM) \\
+\midrule
+Mean $\ln(S_T/S_0)$        & 0.0302  & 0.0287  & 0.0300 \\
+Std $\ln(S_T/S_0)$         & 0.2002  & 0.2028  & 0.2000 \\
+Skewness                   & $-$0.0018 & $-$0.0168 & 0.0000 \\
+Excess Kurtosis            & $-$0.0080 & $+$0.0325 & 0.0000 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+GBM's moments match the theoretical normal distribution closely. Jump Diffusion introduces measurably negative skewness ($-0.017$) and positive excess kurtosis ($+0.033$), confirming that the Poisson jumps produce the heavier tails and left-skew that motivate the model.
+
+\subsection{LSV Leverage Surface}
+
+The LSV calibration produces leverage matrices that deviate from unity primarily at the wings of the volatility surface, confirming that the Heston base model captures ATM dynamics well but requires correction for deep OTM/ITM strikes.
+
+%======================================================================
+\section{Limitations and Future Work}
+%======================================================================
+
+\subsection{Current Limitations}
+
+\begin{enumerate}
+\item Heston Monte Carlo uses Euler-Maruyama discretization, which can introduce bias when the Feller condition is near violation. More advanced schemes such as the QE scheme \parencite{andersen2008} would improve accuracy.
+\item The LSV leverage function uses nearest-neighbor interpolation within JIT-compiled code due to Numba's restrictions on SciPy interpolation.
+\item The backtester's synthetic mode uses BSM-proxy entry prices rather than historical option quotes for all tickers except SPX.
+\item The system relies on yfinance for live options chains, which may experience rate limiting during high-volatility periods.
+\end{enumerate}
+
+\subsection{Future Improvements}
+
+\begin{enumerate}
+\item Variance reduction techniques (antithetic variates, control variates).
+\item American option support via Longstaff-Schwartz least-squares Monte Carlo.
+\item Multi-asset correlation for portfolio-level pricing and risk analysis.
+\item GPU acceleration using CuPy or JAX for massively parallel path simulation.
+\item Extended backtester coverage to additional tickers beyond SPX.
+\end{enumerate}
+
+%======================================================================
+\section{Conclusion}
+%======================================================================
+
+This project demonstrates the integration of mathematical modelling and computer science in the domain of quantitative finance. By implementing four progressively sophisticated option pricing models---BSM, GBM Monte Carlo, Heston Stochastic Volatility, Merton Jump Diffusion, and Local Stochastic Volatility---the system illustrates how each model addresses specific empirical limitations of its predecessor.
+
+The mathematical contributions include implementations of stochastic calculus, numerical integration (Fourier-based Heston pricing), constrained optimization (Heston calibration), and finite-difference PDE methods (Dupire local variance for LSV leverage calibration).
+
+The computer science contributions include vectorized numerical computing, JIT compilation for performance-critical paths, automatic differentiation for exact Greeks, asynchronous API design, and a modular architecture that separates mathematical engines from presentation and data layers.
+
+The system is deployed as a usable research terminal with five analysis tabs, demonstrating that the mathematical theory translates into practical analytical capability. The backtester's explicit methodology disclosure and the calibration engine's Feller condition checking exemplify the project's commitment to scientific honesty and awareness of model limitations.
+
+%======================================================================
+\printbibliography
+%======================================================================
+
+\end{document}

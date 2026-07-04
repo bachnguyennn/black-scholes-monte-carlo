@@ -12,7 +12,6 @@ venv/
 env/
 
 # IDE settings
-.vscode/
 .idea/
 
 # Test and local tooling artifacts
@@ -25,7 +24,6 @@ htmlcov/
 .agent/
 .gemini/
 docs/archive/
-docs/
 
 *.csv
 *.csv.zip
