@@ -10,8 +10,9 @@ import numpy as np
 from src.core.black_scholes import black_scholes_price
 from src.core.gbm_engine import simulate_gbm
 from src.core.heston_model import price_option_heston_fourier, simulate_heston
-from src.core.jump_diffusion import simulate_jump_diffusion
+from src.core.jump_diffusion import simulate_jump_diffusion, merton_jump_price
 from src.core.greeks import calculate_delta, calculate_gamma, calculate_vega, calculate_all_greeks
+from src.core.scanner_engine import price_single_option_mc
 
 print("=" * 70)
 print("MODEL METRICS FOR FINAL REPORT")
@@ -107,6 +108,15 @@ for n_jd in [10_000, 50_000, 100_000]:
     except Exception as e:
         print(f"  MC({n_jd:>7,}) error: {e}")
 
+# Analytic Merton price (Poisson-weighted Black-Scholes sum) — exact ground
+# truth the Monte Carlo above converges to.
+mert = merton_jump_price(S0, K, T, r, sigma, 'call', jump_intensity=lam,
+                         jump_mean=mu_j, jump_std=sigma_j, q=q)
+mert0 = merton_jump_price(S0, K, T, r, sigma, 'call', jump_intensity=0.0,
+                          jump_mean=0.0, jump_std=0.0, q=q)
+print(f"\n  Analytic Merton price = {mert:.6f}  (exact; the MC above converges to this)")
+print(f"  λ=0 limit = {mert0:.6f}  vs BSM {bs_call:.6f}  (diff {abs(mert0 - bs_call):.2e})")
+
 # ══════════════════════════════════════════════════════════════════════
 # 5. GREEKS (BSM Analytical)
 # ══════════════════════════════════════════════════════════════════════
@@ -201,6 +211,26 @@ print(f"  {'Mean(log ret)':<20s}  {log_ret_gbm.mean():>10.4f}  {log_ret_jd.mean(
 print(f"  {'Std(log ret)':<20s}  {log_ret_gbm.std():>10.4f}  {log_ret_jd.std() if jd_ok else 'N/A':>10}  {theory_std:>14.4f}")
 print(f"  {'Skewness':<20s}  {skew(log_ret_gbm):>10.4f}  {skew(log_ret_jd) if jd_ok else 'N/A':>10}  {'0.0000':>14s}")
 print(f"  {'Excess Kurtosis':<20s}  {kurtosis(log_ret_gbm):>10.4f}  {kurtosis(log_ret_jd) if jd_ok else 'N/A':>10}  {'0.0000':>14s}")
+
+# ══════════════════════════════════════════════════════════════════════
+# 8. MONTE CARLO VARIANCE REDUCTION (antithetic + control variate)
+# ══════════════════════════════════════════════════════════════════════
+print("\n■ 8. MC VARIANCE REDUCTION (Jump Diffusion ATM call, equal path budget)")
+n_vr = 20_000
+
+def _naive_jd(seed):
+    np.random.seed(seed)
+    S_T, _ = simulate_jump_diffusion(S0, T, r, sigma, n_vr, jump_intensity=lam,
+                                     jump_mean=mu_j, jump_std=sigma_j)
+    return np.exp(-r * T) * np.maximum(S_T - K, 0).mean()
+
+naive = np.array([_naive_jd(s) for s in range(25)])
+vr = np.array([price_single_option_mc(S0, K, T, r, sigma, 'call', n_vr, lam, mu_j, sigma_j)['mc_price']
+               for _ in range(25)])
+factor = naive.std() / vr.std() if vr.std() > 0 else float('nan')
+print(f"  naive MC std across seeds        = {naive.std():.4f}")
+print(f"  antithetic + control-variate std = {vr.std():.4f}")
+print(f"  => variance reduction = {factor:.1f}x std  ({factor**2:.0f}x variance / paths)")
 
 print("\n" + "=" * 70)
 print("COPY THESE METRICS INTO THE LATEX REPORT")
