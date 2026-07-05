@@ -78,6 +78,23 @@ def render(ticker, option_type, n_sims,
     st.text_input("Expiration Selection", value="Automatic scan across the full CSV", disabled=True)
     bt_exps = None
 
+    pol_col1, pol_col2 = st.columns(2)
+    with pol_col1:
+        sane_selection = st.checkbox(
+            "Near-the-money selection (recommended)", value=True,
+            help="Restrict entries to |moneyness − 1| ≤ 7%, 20–75 DTE, and reject "
+                 "implausible >30% edges. Prevents the engine from buying deep-OTM "
+                 "'lottery ticket' contracts that expire worthless — the main reason "
+                 "the naive backtest blows up.")
+    with pol_col2:
+        calibrate_entries = st.checkbox(
+            "Calibrate to each entry date's surface (slower)", value=True,
+            help="Fit Heston to the live option surface on every entry date so the "
+                 "fair value tracks the market smile instead of an uncalibrated model. "
+                 "More honest, but adds a couple of minutes over the full CSV.")
+    if calibrate_entries:
+        st.caption("Calibration is on: the run will take noticeably longer (a calibration per entry date).")
+
     bt_button = st.button("RUN BACKTEST", type="primary", width="stretch")
 
     st.markdown("---")
@@ -89,6 +106,10 @@ def render(ticker, option_type, n_sims,
                 lsv_leverage = st.session_state.get("lsv_leverage_matrix")
                 lsv_strikes = st.session_state.get("lsv_strikes")
                 lsv_maturities = st.session_state.get("lsv_maturities")
+                policy_kwargs = (
+                    dict(moneyness_band=0.07, entry_min_dte=20, entry_max_dte=75, max_edge=0.30)
+                    if sane_selection else {}
+                )
                 results = run_historical_quotes_backtest(
                     ticker=ticker, period=bt_period, initial_capital=bt_capital,
                     option_type=option_type.lower(), edge_threshold=bt_edge / 100.0,
@@ -99,7 +120,9 @@ def render(ticker, option_type, n_sims,
                     leverage_matrix=lsv_leverage,
                     leverage_strikes=lsv_strikes,
                     leverage_maturities=lsv_maturities,
-                    expiry_days_list=bt_exps
+                    expiry_days_list=bt_exps,
+                    calibrate_per_entry=calibrate_entries,
+                    **policy_kwargs,
                 )
             except Exception as e:
                 st.error(f"Backtester Engine Failure: {str(e)}")

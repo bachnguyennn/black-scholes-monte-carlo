@@ -283,3 +283,50 @@ def test_historical_quote_backtest_force_liquidates_on_equity_breach(monkeypatch
     assert res["max_drawdown_pct"] >= -100.0
     assert pd.isna(res["sharpe_ratio"])
     assert "equity_breach" in set(res["trades_df"]["exit_reason"])
+
+
+def _panel_atm_and_otm():
+    """Each date offers a near-ATM strike and a deep-OTM strike."""
+    dates = pd.bdate_range("2024-09-02", periods=140)
+    rows = []
+    for i, date in enumerate(dates):
+        spot = 100.0 + 0.15 * i + 3.5 * np.sin(i / 4.0)  # oscillate -> nonzero realized vol
+        expiry = date + pd.Timedelta(days=30)
+        # (strike, bid, ask): ATM ~8% spread, OTM ~20% spread (both under the
+        # 35% validity cap so both are candidates before the selection policy).
+        for strike, bid, ask in [(round(spot), 4.8, 5.2), (round(spot * 1.4), 0.9, 1.1)]:
+            rows.append({
+                "QUOTE_DATE": date, "UNDERLYING_LAST": spot, "EXPIRE_DATE": expiry,
+                "DTE": 30.0, "STRIKE": float(strike),
+                "C_BID": bid, "C_ASK": ask, "C_IV": 0.20, "C_DELTA": 0.5,
+                "C_LAST": (bid + ask) / 2, "C_VOLUME": 10.0,
+                "P_BID": bid, "P_ASK": ask, "P_IV": 0.20, "P_DELTA": -0.5,
+                "P_LAST": (bid + ask) / 2, "P_VOLUME": 10.0,
+            })
+    return pd.DataFrame(rows)
+
+
+def test_selection_policy_keeps_near_atm_and_caps_edge(monkeypatch):
+    """The moneyness band + edge cap must stop the engine from selecting the
+    deep-OTM contract whose tiny premium yields a huge relative edge."""
+    monkeypatch.setattr(bt, "load_historical_option_quotes",
+                        lambda csv_path=str(bt.DEFAULT_HISTORICAL_OPTIONS_CSV): _panel_atm_and_otm())
+    # Constant fair value: moderate edge on the ATM contract (~12%), enormous
+    # relative edge on the cheap OTM contract (~430%).
+    monkeypatch.setattr(bt, "_price_and_delta", lambda **kwargs: (5.9, 0.5))
+
+    common = dict(ticker="SPX", period=bt.FULL_HISTORICAL_PERIOD, option_type="call",
+                  model="heston", edge_threshold=0.05, hedge_rebalance_delta_threshold=0.0,
+                  csv_path="ignored.csv")
+
+    # No policy: engine picks the highest-edge contract -> the OTM junk.
+    unguarded = bt.run_historical_quotes_backtest(**common)
+    assert not unguarded["trades_df"].empty
+    assert (unguarded["trades_df"]["strike"] > unguarded["trades_df"]["spot_price"] * 1.2).any()
+
+    # With policy: only near-ATM trades survive.
+    guarded = bt.run_historical_quotes_backtest(
+        moneyness_band=0.07, max_edge=0.30, **common)
+    assert not guarded["trades_df"].empty
+    mny = guarded["trades_df"]["strike"] / guarded["trades_df"]["spot_price"]
+    assert (mny <= 1.07).all() and (mny >= 0.93).all()

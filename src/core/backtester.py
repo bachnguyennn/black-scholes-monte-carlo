@@ -16,6 +16,7 @@ import yfinance as yf
 from src.core.heston_model import price_option_heston_fourier
 from src.core.jump_diffusion import simulate_jump_diffusion
 from src.core.lsv_model import simulate_lsv_paths
+from src.core.calibration_engine import calibrate_heston
 
 
 DEFAULT_HISTORICAL_OPTIONS_CSV = Path(__file__).resolve().parents[2] / "combined_options_data.csv"
@@ -240,15 +241,65 @@ def _select_contract_for_target_dte(
     return _row_to_contract(chosen, option_type)
 
 
-def _list_contract_candidates(entry_rows, option_type, max_spread_pct=DEFAULT_MAX_SPREAD_PCT, min_bid=DEFAULT_MIN_BID):
+def _list_contract_candidates(entry_rows, option_type, max_spread_pct=DEFAULT_MAX_SPREAD_PCT,
+                              min_bid=DEFAULT_MIN_BID, moneyness_band=None,
+                              min_dte=None, max_dte=None):
+    """Return valid entry contracts, nearest-ATM first.
+
+    When moneyness_band / min_dte / max_dte are given, restrict to near-the-money
+    contracts within a sensible expiry window. This avoids the degenerate case of
+    selecting deep-OTM 'lottery ticket' contracts purely because their tiny
+    premium produces a large *relative* model-vs-market gap.
+    """
     valid = _valid_entry_rows(entry_rows, option_type, max_spread_pct=max_spread_pct, min_bid=min_bid)
     if valid.empty:
         return []
 
     valid = valid.copy()
+    valid["moneyness"] = valid["STRIKE"] / valid["UNDERLYING_LAST"]
+    if moneyness_band is not None:
+        valid = valid[(valid["moneyness"] - 1.0).abs() <= moneyness_band]
+    if min_dte is not None:
+        valid = valid[valid["DTE"] >= min_dte]
+    if max_dte is not None:
+        valid = valid[valid["DTE"] <= max_dte]
+    if valid.empty:
+        return []
+
     valid["strike_gap"] = (valid["STRIKE"] - valid["UNDERLYING_LAST"]).abs()
     valid = valid.sort_values(["strike_gap", "spread_pct", "DTE", "STRIKE"])
     return [_row_to_contract(row, option_type) for _, row in valid.iterrows()]
+
+
+def _calibrate_heston_for_date(entry_rows, option_type, spot, risk_free_rate, dividend_yield):
+    """Calibrate Heston to a single day's option surface from the CSV quotes.
+
+    Returns a params dict (kappa, theta, xi, rho, V0) on success, else None.
+    Uses a broad near-ATM band so the fit reflects the whole smile, not just
+    the contract being traded.
+    """
+    valid = _valid_entry_rows(entry_rows, option_type, max_spread_pct=0.5, min_bid=0.05)
+    if valid.empty:
+        return None
+    valid = valid[(valid["STRIKE"] >= spot * 0.85) & (valid["STRIKE"] <= spot * 1.15)]
+    if len(valid) < 6:
+        return None
+
+    cols = _option_quote_columns(option_type)
+    surface = pd.DataFrame({
+        "strike": valid["STRIKE"].astype(float).values,
+        "T": (valid["DTE"].astype(float) / 365.0).values,
+        "type": option_type,
+        "bid": valid[cols["bid"]].astype(float).values,
+        "ask": valid[cols["ask"]].astype(float).values,
+        "mid": valid["market_mid"].astype(float).values,
+        "market_iv": valid[cols["iv"]].astype(float).values,
+    })
+    res = calibrate_heston(surface, float(spot), float(risk_free_rate), q=float(dividend_yield))
+    if not res.get("success"):
+        return None
+    return {"kappa": res["kappa"], "theta": res["theta"], "xi": res["xi"],
+            "rho": res["rho"], "V0": res["V0"]}
 
 
 def _build_contract_history(quotes, option_type, expiry_date, strike):
@@ -410,6 +461,11 @@ def run_historical_quotes_backtest(
     hedge_margin_ratio=0.15,
     max_open_positions=1,
     liquidate_on_equity_breach=True,
+    calibrate_per_entry=False,
+    moneyness_band=None,
+    entry_min_dte=None,
+    entry_max_dte=None,
+    max_edge=None,
 ):
     if str(ticker).upper() not in SUPPORTED_HISTORICAL_OPTION_TICKERS:
         raise ValueError(f"Historical quote backtest currently supports {sorted(SUPPORTED_HISTORICAL_OPTION_TICKERS)} only.")
@@ -543,15 +599,15 @@ def run_historical_quotes_backtest(
                 K=position["strike"],
                 T=T_t,
                 risk_free_rate=risk_free_rate,
-                sigma=position["sigma"],
+                sigma=position.get("pricing_sigma", position["sigma"]),
                 n_sims=n_sims,
                 jump_intensity=jump_intensity,
                 jump_mean=jump_mean,
                 jump_std=jump_std,
-                heston_kappa=heston_kappa,
-                heston_theta=heston_theta,
-                heston_xi=heston_xi,
-                heston_rho=heston_rho,
+                heston_kappa=position.get("eff_kappa", heston_kappa),
+                heston_theta=position.get("eff_theta", heston_theta),
+                heston_xi=position.get("eff_xi", heston_xi),
+                heston_rho=position.get("eff_rho", heston_rho),
                 leverage_matrix=leverage_matrix,
                 leverage_strikes=leverage_strikes,
                 leverage_maturities=leverage_maturities,
@@ -587,6 +643,22 @@ def run_historical_quotes_backtest(
                 entry_rows = quotes[quotes["QUOTE_DATE"] == current_date]
                 best_candidate = None
 
+                # Effective pricing parameters for this entry date. When
+                # calibration is enabled, fit Heston to the day's live surface
+                # so the fair value tracks the market smile instead of an
+                # uncalibrated model that is wildly wrong on the wings.
+                eff_kappa, eff_theta = heston_kappa, heston_theta
+                eff_xi, eff_rho = heston_xi, heston_rho
+                eff_sigma = sigma          # sqrt(V0) used for pricing
+                if calibrate_per_entry and model in ("heston", "lsv"):
+                    calib = _calibrate_heston_for_date(
+                        entry_rows, option_type, spot, risk_free_rate, dividend_yield
+                    )
+                    if calib is not None:
+                        eff_kappa, eff_theta = calib["kappa"], calib["theta"]
+                        eff_xi, eff_rho = calib["xi"], calib["rho"]
+                        eff_sigma = float(np.sqrt(max(calib["V0"], 1e-6)))
+
                 if isinstance(expiry_days_list, (list, tuple)) and len(expiry_days_list) > 0:
                     contract_candidates = []
                     for expiry_days in expiry_days_list:
@@ -605,6 +677,9 @@ def run_historical_quotes_backtest(
                         option_type,
                         max_spread_pct=max_spread_pct,
                         min_bid=min_quote_bid,
+                        moneyness_band=moneyness_band,
+                        min_dte=entry_min_dte,
+                        max_dte=entry_max_dte,
                     )]
 
                 for contract, target_dte in contract_candidates:
@@ -616,15 +691,15 @@ def run_historical_quotes_backtest(
                         K=contract["strike"],
                         T=T_initial,
                         risk_free_rate=risk_free_rate,
-                        sigma=sigma,
+                        sigma=eff_sigma,
                         n_sims=n_sims,
                         jump_intensity=jump_intensity,
                         jump_mean=jump_mean,
                         jump_std=jump_std,
-                        heston_kappa=heston_kappa,
-                        heston_theta=heston_theta,
-                        heston_xi=heston_xi,
-                        heston_rho=heston_rho,
+                        heston_kappa=eff_kappa,
+                        heston_theta=eff_theta,
+                        heston_xi=eff_xi,
+                        heston_rho=eff_rho,
                         leverage_matrix=leverage_matrix,
                         leverage_strikes=leverage_strikes,
                         leverage_maturities=leverage_maturities,
@@ -643,6 +718,11 @@ def run_historical_quotes_backtest(
                         continue
                     current_edge = (fair_p - execution_price) / execution_price
                     if current_edge < edge_threshold:
+                        continue
+                    # Reject implausibly large edges: after calibration a
+                    # >max_edge gap is model error, not opportunity (typically
+                    # a mispriced deep-OTM wing).
+                    if max_edge is not None and current_edge > max_edge:
                         continue
 
                     entry_tx_cost_per_contract = execution_price * option_multiplier * (tx_cost_bps / 10000.0)
@@ -694,6 +774,11 @@ def run_historical_quotes_backtest(
                         "spot_price": best_contract["spot"],
                         "strike": best_contract["strike"],
                         "sigma": sigma,
+                        "pricing_sigma": eff_sigma,
+                        "eff_kappa": eff_kappa,
+                        "eff_theta": eff_theta,
+                        "eff_xi": eff_xi,
+                        "eff_rho": eff_rho,
                         "fair_value": best_candidate["fair_value"],
                         "target_dte": best_candidate["target_dte"],
                         "actual_dte": best_contract["dte"],
