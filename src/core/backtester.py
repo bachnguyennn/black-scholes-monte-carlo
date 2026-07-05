@@ -466,9 +466,15 @@ def run_historical_quotes_backtest(
     entry_min_dte=None,
     entry_max_dte=None,
     max_edge=None,
+    strategy_side="long",
+    max_capital_fraction_per_trade=None,
 ):
     if str(ticker).upper() not in SUPPORTED_HISTORICAL_OPTION_TICKERS:
         raise ValueError(f"Historical quote backtest currently supports {sorted(SUPPORTED_HISTORICAL_OPTION_TICKERS)} only.")
+
+    # +1 = long options (buy when the model says cheap); -1 = short options
+    # (sell when the model says rich, harvesting the variance risk premium).
+    side_sign = 1.0 if str(strategy_side).lower() == "long" else -1.0
 
     quotes = load_historical_option_quotes(str(csv_path))
     if quotes.empty:
@@ -507,7 +513,8 @@ def run_historical_quotes_backtest(
         net = free_cash_net
         for position in open_positions:
             quote = _quote_asof(position["quote_history"], current_date)
-            option_value = position["contracts"] * option_multiplier * (
+            # Long options are a positive asset; short options are a liability.
+            option_value = position["side_sign"] * position["contracts"] * option_multiplier * (
                 quote["mid"] if quote and np.isfinite(quote["mid"]) and current_date < position["settlement_date"]
                 else max(spot_price - position["strike"], 0) if position["option_type"] == "call"
                 else max(position["strike"] - spot_price, 0)
@@ -522,14 +529,20 @@ def run_historical_quotes_backtest(
     def close_position(position, current_date, spot_price, exit_reason="expiry"):
         nonlocal free_cash_gross, free_cash_net, forced_liquidations
 
+        s = position["side_sign"]
         quote = _quote_asof(position["quote_history"], current_date)
         intrinsic = max(spot_price - position["strike"], 0) if position["option_type"] == "call" else max(position["strike"] - spot_price, 0)
+        # Close price: at expiry the option settles to intrinsic. On an early
+        # close a long sells at the bid, a short buys back at the ask.
         if exit_reason == "expiry":
-            option_cashflow = intrinsic * option_multiplier * position["contracts"]
-        elif quote and np.isfinite(quote["bid"]) and current_date < position["settlement_date"]:
-            option_cashflow = quote["bid"] * option_multiplier * position["contracts"]
+            close_price = intrinsic
+        elif quote and current_date < position["settlement_date"]:
+            early_quote = quote["bid"] if s > 0 else quote["ask"]
+            close_price = early_quote if np.isfinite(early_quote) else intrinsic
         else:
-            option_cashflow = intrinsic * option_multiplier * position["contracts"]
+            close_price = intrinsic
+        # Long receives the close value (+); short pays it (-).
+        option_cashflow = s * close_price * option_multiplier * position["contracts"]
 
         final_gross = option_cashflow + position["hedge_pnl_gross"] + position["hedge_margin_reserve"]
         final_net = option_cashflow + position["hedge_pnl_net"] + position["hedge_margin_reserve"]
@@ -548,7 +561,7 @@ def run_historical_quotes_backtest(
             'exit_date': current_date.strftime('%Y-%m-%d'),
             'expiry_date': position["expiry_date"].strftime('%Y-%m-%d'),
             'exit_reason': exit_reason,
-            'type': f'{position["option_type"].upper()}_HEDGED',
+            'type': f'{"SHORT" if position["side_sign"] < 0 else "LONG"}_{position["option_type"].upper()}_HEDGED',
             'spot_price': round(position["spot_price"], 2),
             'strike': round(position["strike"], 2),
             'contracts': int(position["contracts"]),
@@ -614,7 +627,7 @@ def run_historical_quotes_backtest(
                 dividend_yield=dividend_yield,
                 seed=seed,
             )
-            target_shares = _hedge_target_shares(delta_t, position["contracts"], option_multiplier)
+            target_shares = position["side_sign"] * _hedge_target_shares(delta_t, position["contracts"], option_multiplier)
             shares_needed = target_shares - position["hedge_shares"]
             delta_gap = abs(shares_needed) / max(option_multiplier * position["contracts"], 1)
             if delta_gap >= hedge_rebalance_delta_threshold:
@@ -713,10 +726,19 @@ def run_historical_quotes_backtest(
                     if settlement_date <= current_date:
                         continue
 
-                    execution_price = contract["market_ask"] * (1 + slippage_pct)
-                    if execution_price <= 0:
-                        continue
-                    current_edge = (fair_p - execution_price) / execution_price
+                    # Execution: a long crosses the ask (+slippage); a short
+                    # hits the bid (-slippage). Edge is the fractional advantage
+                    # over the transacted price in the favorable direction.
+                    if side_sign > 0:
+                        execution_price = contract["market_ask"] * (1 + slippage_pct)
+                        if execution_price <= 0:
+                            continue
+                        current_edge = (fair_p - execution_price) / execution_price
+                    else:
+                        execution_price = contract["market_bid"] * (1 - slippage_pct)
+                        if execution_price <= 0 or fair_p <= 0:
+                            continue
+                        current_edge = (execution_price - fair_p) / execution_price
                     if current_edge < edge_threshold:
                         continue
                     # Reject implausibly large edges: after calibration a
@@ -725,12 +747,23 @@ def run_historical_quotes_backtest(
                     if max_edge is not None and current_edge > max_edge:
                         continue
 
-                    entry_tx_cost_per_contract = execution_price * option_multiplier * (tx_cost_bps / 10000.0)
+                    premium_per_contract = execution_price * option_multiplier
+                    entry_tx_cost_per_contract = premium_per_contract * (tx_cost_bps / 10000.0)
                     hedge_margin_per_contract = abs(_hedge_target_shares(entry_delta, 1, option_multiplier) * contract["spot"]) * hedge_margin_ratio
-                    entry_notional_gross_per_contract = execution_price * option_multiplier
+                    # Signed premium: cash out for a long, cash in for a short.
+                    entry_notional_gross_per_contract = side_sign * premium_per_contract
                     entry_notional_net_per_contract = entry_notional_gross_per_contract + entry_tx_cost_per_contract
                     entry_cash_commitment_per_contract = entry_notional_net_per_contract + hedge_margin_per_contract
-                    contracts = int(np.floor(free_cash_net / entry_cash_commitment_per_contract)) if entry_cash_commitment_per_contract > 0 else 0
+                    # Capital to set aside per contract: never below the posted
+                    # margin (a short's received premium can push the net outlay
+                    # below the margin it must still post).
+                    capital_per_contract = max(entry_cash_commitment_per_contract, hedge_margin_per_contract, 1e-6)
+                    contracts = int(np.floor(free_cash_net / capital_per_contract))
+                    # Position-size cap: limit the premium notional at risk per
+                    # trade to a fraction of starting capital.
+                    if max_capital_fraction_per_trade is not None and premium_per_contract > 0:
+                        risk_contracts = int(np.floor(max_capital_fraction_per_trade * initial_capital / premium_per_contract))
+                        contracts = min(contracts, risk_contracts)
                     if contracts < 1:
                         continue
 
@@ -755,7 +788,8 @@ def run_historical_quotes_backtest(
                     best_contract = best_candidate["contract"]
                     contracts = best_candidate["contracts"]
                     hedge_margin_reserve = best_candidate["hedge_margin_per_contract"] * contracts
-                    initial_hedge_shares = _hedge_target_shares(best_candidate["entry_delta"], contracts, option_multiplier)
+                    # Long option -> short the underlying; short option -> long it.
+                    initial_hedge_shares = side_sign * _hedge_target_shares(best_candidate["entry_delta"], contracts, option_multiplier)
                     initial_hedge_cost = 0.0
                     initial_delta_gap = abs(initial_hedge_shares) / max(option_multiplier * contracts, 1)
                     if initial_delta_gap >= hedge_rebalance_delta_threshold:
@@ -773,6 +807,7 @@ def run_historical_quotes_backtest(
                         "contracts": contracts,
                         "spot_price": best_contract["spot"],
                         "strike": best_contract["strike"],
+                        "side_sign": side_sign,
                         "sigma": sigma,
                         "pricing_sigma": eff_sigma,
                         "eff_kappa": eff_kappa,
@@ -872,6 +907,7 @@ def run_historical_quotes_backtest(
         'cost_sensitivity': cost_sensitivity,
         'methodology': {
             'fair_value_model': model,
+            'strategy_side': strategy_side,
             'entry_market_price_source': 'historical_option_bid_ask_mid',
             'uses_historical_option_quotes': True,
             'lookahead_guard': True,

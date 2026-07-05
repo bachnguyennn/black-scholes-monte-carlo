@@ -78,22 +78,42 @@ def render(ticker, option_type, n_sims,
     st.text_input("Expiration Selection", value="Automatic scan across the full CSV", disabled=True)
     bt_exps = None
 
+    side_col, size_col = st.columns(2)
+    with side_col:
+        side_label = st.selectbox(
+            "Strategy Side",
+            ["Short (sell rich / harvest variance premium)", "Long (buy cheap)"],
+            help="Long buys options the model calls cheap and delta-hedges — it pays "
+                 "the variance risk premium and structurally loses. Short sells options "
+                 "the model calls rich, harvesting that premium: profitable in calm "
+                 "periods but exposed to volatility spikes and crashes (tail risk).")
+        strategy_side = "short" if side_label.startswith("Short") else "long"
+    with size_col:
+        risk_pct = st.slider(
+            "Max capital at risk per trade (%)", min_value=5, max_value=100, value=15, step=5,
+            help="Caps the premium notional of each trade to this fraction of starting "
+                 "capital, preventing the all-in sizing that caused the large drawdowns.")
+
     pol_col1, pol_col2 = st.columns(2)
     with pol_col1:
         sane_selection = st.checkbox(
             "Near-the-money selection (recommended)", value=True,
             help="Restrict entries to |moneyness − 1| ≤ 7%, 20–75 DTE, and reject "
-                 "implausible >30% edges. Prevents the engine from buying deep-OTM "
-                 "'lottery ticket' contracts that expire worthless — the main reason "
-                 "the naive backtest blows up.")
+                 "implausible >30% edges. Prevents the engine from picking deep-OTM "
+                 "'lottery ticket' contracts — the main reason the naive backtest blows up.")
     with pol_col2:
         calibrate_entries = st.checkbox(
-            "Calibrate to each entry date's surface (slower)", value=True,
-            help="Fit Heston to the live option surface on every entry date so the "
-                 "fair value tracks the market smile instead of an uncalibrated model. "
-                 "More honest, but adds a couple of minutes over the full CSV.")
+            "Calibrate to each entry date's surface (slower)", value=False,
+            help="Fit Heston to the live option surface on every entry date. This makes "
+                 "the model track the market, which removes the model-vs-market gap the "
+                 "strategy trades on — an efficient-market check. Adds a couple of minutes.")
     if calibrate_entries:
-        st.caption("Calibration is on: the run will take noticeably longer (a calibration per entry date).")
+        st.caption("Calibration on: slower, and it largely removes the edge — the fitted model matches the market, so gaps shrink toward zero.")
+    if strategy_side == "short":
+        st.warning(
+            "Short vol harvests the variance risk premium — historically profitable, but it is "
+            "selling insurance against crashes. The 2010–2013 CSV window has no major volatility "
+            "spike, so in-sample returns understate the true tail risk.")
 
     bt_button = st.button("RUN BACKTEST", type="primary", width="stretch")
 
@@ -122,6 +142,8 @@ def render(ticker, option_type, n_sims,
                     leverage_maturities=lsv_maturities,
                     expiry_days_list=bt_exps,
                     calibrate_per_entry=calibrate_entries,
+                    strategy_side=strategy_side,
+                    max_capital_fraction_per_trade=risk_pct / 100.0,
                     **policy_kwargs,
                 )
             except Exception as e:

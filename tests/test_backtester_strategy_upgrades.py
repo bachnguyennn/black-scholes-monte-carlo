@@ -306,6 +306,56 @@ def _panel_atm_and_otm():
     return pd.DataFrame(rows)
 
 
+def _panel_rich_worthless_calls():
+    """Calls quoted rich (bid 5.0) on an underlying that steadily declines, so
+    the options selected at entry expire out-of-the-money (worthless)."""
+    dates = pd.bdate_range("2024-09-02", periods=220)
+    rows = []
+    for i, date in enumerate(dates):
+        spot = 140.0 - 0.4 * i + 2.0 * np.sin(i / 4.0)  # declining + wiggle
+        expiry = date + pd.Timedelta(days=30)
+        strike = float(round(spot))
+        rows.append({
+            "QUOTE_DATE": date, "UNDERLYING_LAST": spot, "EXPIRE_DATE": expiry,
+            "DTE": 30.0, "STRIKE": strike,
+            "C_BID": 5.0, "C_ASK": 5.4, "C_IV": 0.20, "C_DELTA": 0.5,
+            "C_LAST": 5.2, "C_VOLUME": 10.0,
+            "P_BID": 5.0, "P_ASK": 5.4, "P_IV": 0.20, "P_DELTA": -0.5,
+            "P_LAST": 5.2, "P_VOLUME": 10.0,
+        })
+    return pd.DataFrame(rows)
+
+
+def test_short_vol_profits_where_long_correctly_abstains(monkeypatch):
+    """The calls are richer than the model's fair value, so a long buyer should
+    never touch them, while a short seller collects the premium as they expire
+    worthless. Verifies the short side's cashflow signs end to end."""
+    monkeypatch.setattr(bt, "load_historical_option_quotes",
+                        lambda csv_path=str(bt.DEFAULT_HISTORICAL_OPTIONS_CSV): _panel_rich_worthless_calls())
+    # Model fair value (3.0) below the 5.0 bid; delta 0 -> isolate the option
+    # cashflow from hedging for a clean, deterministic check.
+    monkeypatch.setattr(bt, "_price_and_delta", lambda **kwargs: (3.0, 0.0))
+
+    common = dict(ticker="SPX", period=bt.FULL_HISTORICAL_PERIOD, option_type="call",
+                  model="heston", edge_threshold=0.05, hedge_rebalance_delta_threshold=0.0,
+                  initial_capital=10000.0, max_capital_fraction_per_trade=0.5,
+                  csv_path="ignored.csv")
+
+    long_res = bt.run_historical_quotes_backtest(strategy_side="long", **common)
+    short_res = bt.run_historical_quotes_backtest(strategy_side="short", **common)
+
+    # A long buyer will not pay 5.4 for something the model values at 3.0.
+    assert long_res["trades_df"].empty
+    assert long_res["final_value"] == 10000.0
+
+    # The short seller collects premium on options that expire worthless.
+    assert not short_res["trades_df"].empty
+    assert short_res["final_value"] > 10000.0
+    assert short_res["methodology"]["strategy_side"] == "short"
+    assert short_res["trades_df"]["type"].str.startswith("SHORT").all()
+    assert (short_res["trades_df"]["pnl_net"] > 0).all()
+
+
 def test_selection_policy_keeps_near_atm_and_caps_edge(monkeypatch):
     """The moneyness band + edge cap must stop the engine from selecting the
     deep-OTM contract whose tiny premium yields a huge relative edge."""
