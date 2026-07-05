@@ -330,6 +330,8 @@ The historical workflow enforces:
 - **Cost sensitivity analysis**: Final returns are reported under 0.5×, 1.0×, and 1.5× cost multiplier scenarios
 - **Methodology disclosure**: The backtester explicitly labels its data sources and assumptions in the output
 
+It also exposes the strategy controls used in Section 9.4: a **strategy side** (long volatility—buy options priced as cheap—or short volatility—sell options priced as rich), a **near-the-money selection policy** (moneyness band, expiry window, and an edge cap that rejects implausible deep-OTM signals), optional **per-entry calibration** (fitting Heston to each day's live surface so the fair value tracks the market smile), and a **per-trade position-size cap** expressed as a fraction of capital.
+
 ---
 
 ## 9. Results
@@ -354,12 +356,24 @@ The Fourier-based Heston pricer processes entire options chains in under 5 secon
 
 ### 9.4 Backtester Insights
 
-The delta-hedged backtester demonstrates that:
-- Transaction costs and slippage materially affect strategy returns (cost sensitivity analysis shows 30–50% return variation across cost scenarios)
-- Model choice affects edge detection: Heston tends to price OTM puts higher than BSM, generating different signal distributions
-- The no-look-ahead guard prevents the most common form of backtest contamination
+The delta-hedged backtester produced a sequence of findings that, taken together, form the most instructive result of the project. All figures below use the historical SPX quote window available in the dataset (2010–2013), near-the-money contracts (\|moneyness − 1\| ≤ 7%, 20–75 days to expiry), a per-trade risk cap of 15% of capital, and daily delta rebalancing.
 
-[INSERT TABLE 4: Historical backtest metrics with final value, total return, Sharpe ratio, max drawdown, win rate, total trades, and total hedge costs]
+**The naive strategy fails, and not because of costs.** A long strategy that simply buys whatever the model prices as most underpriced loses roughly half of capital. Decomposing the profit and loss shows that transaction costs account for only a small fraction of the loss—removing all costs changes the result by under two percentage points. The true cause is contract selection: ranking candidates by *relative* percentage edge systematically selects deep out-of-the-money contracts (25–38% OTM in the observed trades), where a small volatility difference produces a large relative mispricing on a tiny premium. These "lottery ticket" contracts expired worthless.
+
+**Near-the-money selection corrects the pathology but reveals a deeper one.** Restricting the universe to near-the-money contracts and rejecting implausible edges eliminates the lottery-ticket trades; the reported edges fall from 175–320% to a plausible 7–30%. The long strategy still loses (Table 4), because it is structurally *long* volatility: a delta-hedged long option pays the variance risk premium—implied volatility exceeds subsequently realized volatility on average—and delta hedging removes the directional upside that would otherwise mask it.
+
+**Reversing the direction harvests that premium.** A short-volatility strategy—selling options the model prices as rich and delta-hedging—reverses the sign of the result. To confirm the profit is the variance risk premium and not a disguised directional bet in a rising market, the strategy was run on both calls and puts, whose delta hedges point in opposite directions (short calls hedge with long stock, short puts with short stock). Both are profitable, and short puts win 86% of trades *despite* their short-stock hedge working against the 2010–2013 rally—isolating the premium as the source of return. Short calls earn more than short puts precisely because their long-stock hedge additionally benefits from the market's upward drift, so the short-put result is the cleaner estimate of the pure premium.
+
+**Table 4: Historical backtest by strategy side and option type** (near-ATM selection, 15% per-trade sizing, daily hedging, SPX 2010–2013).
+
+| Strategy | Total Return | Sharpe | Win Rate |
+|---|---|---|---|
+| Long call | −71% | −0.38 | 17% |
+| Long put | −3% | — | (1 trade) |
+| Short call | +133% | 1.40 | 50% |
+| Short put | **+45%** | **0.55** | **86%** |
+
+**Two caveats keep this honest.** First, enabling per-entry calibration—fitting Heston to each day's live surface before pricing—largely removes the edge: once the model reproduces the market, the model-versus-market gap the strategy trades on collapses toward zero. The profit is therefore a *risk premium*, not a mispricing, consistent with an efficient market. Second, the 2010–2013 sample contains no major volatility spike, so it excludes exactly the tail event (a 2008- or 2020-style dislocation) that a short-volatility seller is compensated for bearing; the reported Sharpe ratios overstate the true risk-adjusted return. The application surfaces this warning directly in the backtester interface. The no-look-ahead guard, daily-rehedged accounting (which reconciles to the equity curve to the cent), and cost-sensitivity reporting remain in force throughout.
 
 ### 9.5 LSV Leverage Surface
 
