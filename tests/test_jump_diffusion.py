@@ -14,10 +14,15 @@ import os
 # Add src to path
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
-from src.core.jump_diffusion import simulate_jump_diffusion, simulate_jump_diffusion_paths
+from src.core.jump_diffusion import (
+    simulate_jump_diffusion,
+    simulate_jump_diffusion_paths,
+    merton_jump_price,
+)
 from src.core.gbm_engine import simulate_gbm
 from src.core.scanner_engine import price_single_option_mc
 from src.core.black_scholes import black_scholes_price
+from src.core.greeks import calculate_delta, calculate_gamma, calculate_vega
 
 
 class TestPerformance:
@@ -314,6 +319,68 @@ class TestVarianceReduction:
         ref = np.exp(-r * T) * np.maximum(S_ref - K, 0.0).mean()
         price = price_single_option_mc(S0, K, T, r, sigma, 'call', 40000, lam, jm, js)['mc_price']
         assert abs(price - ref) < 0.1
+
+
+class TestMertonAnalytic:
+    """Analytic Merton (1976) price as ground truth for the MC engine."""
+
+    def test_reduces_to_black_scholes_without_jumps(self):
+        S0, K, T, r, sigma = 100.0, 100.0, 0.5, 0.03, 0.2
+        merton = merton_jump_price(S0, K, T, r, sigma, 'call',
+                                   jump_intensity=0.0, jump_mean=0.0, jump_std=0.0)
+        bs = black_scholes_price(S0, K, T, r, sigma, option_type='call')
+        assert abs(merton - bs) < 1e-9
+
+    def test_put_call_parity(self):
+        S0, K, T, r = 100.0, 105.0, 0.75, 0.03
+        sigma, lam, jm, js = 0.25, 0.4, -0.12, 0.08
+        c = merton_jump_price(S0, K, T, r, sigma, 'call', lam, jm, js)
+        p = merton_jump_price(S0, K, T, r, sigma, 'put', lam, jm, js)
+        assert abs((c - p) - (S0 - K * np.exp(-r * T))) < 1e-6
+
+    def test_matches_monte_carlo_reference(self):
+        S0, K, T, r, sigma = 100.0, 100.0, 0.5, 0.03, 0.2
+        lam, jm, js = 0.5, -0.15, 0.10
+        np.random.seed(0)
+        S_T, _ = simulate_jump_diffusion(
+            S0, T, r, sigma, 2_000_000,
+            jump_intensity=lam, jump_mean=jm, jump_std=js
+        )
+        mc = np.exp(-r * T) * np.maximum(S_T - K, 0.0).mean()
+        analytic = merton_jump_price(S0, K, T, r, sigma, 'call', lam, jm, js)
+        assert abs(analytic - mc) < 0.02
+
+
+class TestJumpDiffusionGreeks:
+    """Greeks under jump diffusion must reflect the model, not fall back to BS."""
+
+    def test_greeks_are_model_consistent_and_differ_from_bs(self):
+        S0, K, T, r, sigma = 100.0, 100.0, 0.5, 0.03, 0.2
+        jk = dict(jump_intensity=0.5, jump_mean=-0.15, jump_std=0.10)
+
+        d_jd = calculate_delta(S0, K, T, r, sigma, 'call', model='jump_diffusion', **jk)
+        g_jd = calculate_gamma(S0, K, T, r, sigma, 'call', model='jump_diffusion', **jk)
+        v_jd = calculate_vega(S0, K, T, r, sigma, 'call', model='jump_diffusion', **jk)
+
+        d_bs = calculate_delta(S0, K, T, r, sigma, 'call', model='gbm')
+        g_bs = calculate_gamma(S0, K, T, r, sigma, 'call', model='gbm')
+
+        # Sane bounds for a call
+        assert 0.0 < d_jd < 1.0
+        assert g_jd > 0.0
+        assert v_jd > 0.0
+        # Jump risk genuinely changes the sensitivities
+        assert abs(d_jd - d_bs) > 1e-3
+        assert abs(g_jd - g_bs) > 1e-4
+
+    def test_delta_matches_finite_difference_of_price(self):
+        S0, K, T, r, sigma = 100.0, 100.0, 0.5, 0.03, 0.2
+        jk = dict(jump_intensity=0.3, jump_mean=-0.10, jump_std=0.05)
+        h = 0.05
+        fd = (merton_jump_price(S0 + h, K, T, r, sigma, 'call', **jk)
+              - merton_jump_price(S0 - h, K, T, r, sigma, 'call', **jk)) / (2 * h)
+        delta = calculate_delta(S0, K, T, r, sigma, 'call', model='jump_diffusion', **jk)
+        assert abs(delta - fd) < 1e-3
 
 
 if __name__ == "__main__":

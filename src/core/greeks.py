@@ -22,8 +22,23 @@ except ImportError:
     jax_norm = None
     JAX_AVAILABLE = False
 
-from .jump_diffusion import simulate_jump_diffusion
+from .jump_diffusion import simulate_jump_diffusion, merton_jump_price
 from .gbm_engine import simulate_gbm
+
+
+def _jump_kwargs(kwargs):
+    """Pull the Merton jump parameters (and dividend yield) out of **kwargs."""
+    return dict(
+        jump_intensity=kwargs.get('jump_intensity', 0.1),
+        jump_mean=kwargs.get('jump_mean', -0.05),
+        jump_std=kwargs.get('jump_std', 0.03),
+        q=kwargs.get('q', 0.0),
+    )
+
+
+def _merton(S0, K, T, r, sigma, option_type, kwargs):
+    return merton_jump_price(S0, K, T, r, sigma, option_type=option_type,
+                             **_jump_kwargs(kwargs))
 
 if JAX_AVAILABLE:
     @jax.jit
@@ -76,14 +91,16 @@ def price_option(S0, K, T, r, sigma, option_type='call', model='gbm', n_sims=500
     Output:
         price: Option price (float)
     """
-    # Simulate terminal prices
+    # Jump diffusion has an exact analytic price (Merton series) -- use it
+    # rather than a noisy Monte Carlo estimate.
+    if model == 'jump_diffusion':
+        return _merton(S0, K, T, r, sigma, option_type.lower(), kwargs)
+
     if model == 'gbm':
         S_T = simulate_gbm(S0, T, r, sigma, n_sims)
-    elif model == 'jump_diffusion':
-        S_T, _ = simulate_jump_diffusion(S0, T, r, sigma, n_sims, **kwargs)
     else:
         raise ValueError(f"Unknown model: {model}")
-    
+
     # Calculate payoffs
     if option_type.lower() == 'call':
         payoffs = np.maximum(S_T - K, 0)
@@ -91,19 +108,30 @@ def price_option(S0, K, T, r, sigma, option_type='call', model='gbm', n_sims=500
         payoffs = np.maximum(K - S_T, 0)
     else:
         raise ValueError(f"Unknown option_type: {option_type}")
-    
+
     # Discount to present value
     price = np.exp(-r * T) * np.mean(payoffs)
-    
+
     return price
 
 
-def calculate_delta(S0, K, T, r, sigma, option_type='call', 
+def calculate_delta(S0, K, T, r, sigma, option_type='call',
                     model='gbm', h=0.01, n_sims=50000, **kwargs):
     """
-    Calculate Delta using JAX Automatic Differentiation (exact Black-Scholes equivalent).
+    Calculate Delta.
+
+    For 'jump_diffusion', Delta is a central finite difference on the exact
+    Merton analytic price, so it reflects jump risk. For 'gbm'/Black-Scholes
+    it uses JAX automatic differentiation (exact, noise-free).
     """
-    is_call = option_type.lower() == 'call'
+    opt = option_type.lower()
+    if model == 'jump_diffusion':
+        hS = max(S0 * 1e-3, 1e-4)
+        up = _merton(S0 + hS, K, T, r, sigma, opt, kwargs)
+        dn = _merton(S0 - hS, K, T, r, sigma, opt, kwargs)
+        return (up - dn) / (2.0 * hS)
+
+    is_call = opt == 'call'
     if JAX_AVAILABLE:
         return float(_jax_delta(S0, K, T, r, sigma, is_call))
 
@@ -116,11 +144,22 @@ def calculate_delta(S0, K, T, r, sigma, option_type='call',
 def calculate_vega(S0, K, T, r, sigma, option_type='call',
                    model='gbm', h=0.01, n_sims=50000, **kwargs):
     """
-    Calculate Vega using JAX Automatic Differentiation.
-    Returns the sensitivity to a 1 point (100%) change in vol. 
-    Traditionally reported as value change per 1% vol change.
+    Calculate Vega (sensitivity to the diffusion volatility), reported per 1%
+    vol change.
+
+    For 'jump_diffusion' this is a central finite difference on the Merton
+    price w.r.t. the diffusion sigma; for 'gbm'/Black-Scholes it uses JAX
+    automatic differentiation.
     """
-    is_call = option_type.lower() == 'call'
+    opt = option_type.lower()
+    if model == 'jump_diffusion':
+        hv = 0.01
+        up = _merton(S0, K, T, r, sigma + hv, opt, kwargs)
+        dn = _merton(S0, K, T, r, max(sigma - hv, 1e-6), opt, kwargs)
+        raw_vega = (up - dn) / (2.0 * hv)   # per unit vol
+        return raw_vega / 100.0
+
+    is_call = opt == 'call'
     if JAX_AVAILABLE:
         raw_vega = float(_jax_vega(S0, K, T, r, sigma, is_call))
     else:
@@ -132,9 +171,21 @@ def calculate_vega(S0, K, T, r, sigma, option_type='call',
 def calculate_gamma(S0, K, T, r, sigma, option_type='call',
                     model='gbm', h=0.01, n_sims=50000, **kwargs):
     """
-    Calculate Gamma using JAX Automatic Differentiation (Second derivative w.r.t S).
+    Calculate Gamma (second derivative w.r.t. spot).
+
+    For 'jump_diffusion' this is a second-order central finite difference on
+    the Merton price; for 'gbm'/Black-Scholes it uses JAX automatic
+    differentiation.
     """
-    is_call = option_type.lower() == 'call'
+    opt = option_type.lower()
+    if model == 'jump_diffusion':
+        hS = max(S0 * 1e-3, 1e-4)
+        up = _merton(S0 + hS, K, T, r, sigma, opt, kwargs)
+        mid = _merton(S0, K, T, r, sigma, opt, kwargs)
+        dn = _merton(S0 - hS, K, T, r, sigma, opt, kwargs)
+        return (up - 2.0 * mid + dn) / (hS * hS)
+
+    is_call = opt == 'call'
     if JAX_AVAILABLE:
         return float(_jax_gamma(S0, K, T, r, sigma, is_call))
 

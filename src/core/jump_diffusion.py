@@ -21,6 +21,7 @@ Reference: Merton (1976) "Option pricing when underlying stock returns are disco
 """
 
 import numpy as np
+from scipy.stats import norm
 
 try:
     from numba import njit
@@ -29,6 +30,77 @@ except ImportError:
         def decorator(func):
             return func
         return decorator
+
+
+def merton_jump_price(S0, K, T, r, sigma, option_type='call',
+                      jump_intensity=0.1, jump_mean=-0.05, jump_std=0.03,
+                      q=0.0, n_terms=60):
+    """
+    Analytic Merton (1976) jump-diffusion price.
+
+    Conditional on exactly n jumps, the terminal price is lognormal, so the
+    option price is a Poisson-weighted sum of Black-Scholes (Black-76 forward)
+    prices:
+
+        C = sum_{n>=0} e^{-lam*T} (lam*T)^n / n! * BS_forward(F_n, K, T, r, sigma_n)
+
+    where, matching the compensated risk-neutral drift used by the Monte Carlo
+    engine (r - q - lam*k, with k = E[e^Y - 1]):
+
+        m       = jump_mean + 0.5*jump_std^2          (= ln E[e^Y])
+        k       = e^m - 1
+        sigma_n^2 = sigma^2 * T + n * jump_std^2       (total variance)
+        F_n     = S0 * exp((r - q - lam*k) * T + n*m)  (forward given n jumps)
+
+    Summed over n, the forwards satisfy E[F_n] = S0*e^{(r-q)T}, so the model is
+    a martingale. This is exact (to the truncation of the Poisson series) and
+    serves as the analytic ground truth for the jump-diffusion Monte Carlo.
+
+    Inputs mirror simulate_jump_diffusion; n_terms caps the Poisson series.
+
+    Output:
+        float: option price
+    """
+    lam = jump_intensity
+    disc = np.exp(-r * T)
+
+    if T <= 0 or sigma <= 0:
+        intrinsic = max(S0 - K, 0.0) if option_type == 'call' else max(K - S0, 0.0)
+        return float(intrinsic)
+
+    m = jump_mean + 0.5 * jump_std ** 2   # ln E[e^Y]
+    k = np.exp(m) - 1.0
+    lamT = lam * T
+
+    price = 0.0
+    log_w = -lamT                          # log Poisson weight, n = 0
+    for n in range(n_terms):
+        if n > 0:
+            if lamT <= 0.0:
+                break                      # no jumps: only the n = 0 term
+            log_w += np.log(lamT) - np.log(n)
+        w = np.exp(log_w)
+        if n > lamT and w < 1e-14:
+            break                          # tail weight negligible
+
+        var_n = sigma ** 2 * T + n * jump_std ** 2
+        sd_n = np.sqrt(var_n)
+        F_n = S0 * np.exp((r - q - lam * k) * T + n * m)
+
+        if sd_n < 1e-12:
+            payoff = max(F_n - K, 0.0) if option_type == 'call' else max(K - F_n, 0.0)
+            term = disc * payoff
+        else:
+            d1 = (np.log(F_n / K) + 0.5 * var_n) / sd_n
+            d2 = d1 - sd_n
+            if option_type == 'call':
+                term = disc * (F_n * norm.cdf(d1) - K * norm.cdf(d2))
+            else:
+                term = disc * (K * norm.cdf(-d2) - F_n * norm.cdf(-d1))
+
+        price += w * term
+
+    return float(max(price, 0.0))
 
 @njit(fastmath=True)
 def simulate_jump_diffusion(S0, T, r, sigma, n_sims, 
