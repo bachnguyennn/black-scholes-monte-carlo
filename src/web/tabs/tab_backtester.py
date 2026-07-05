@@ -17,6 +17,7 @@ from src.core.backtester import (
     has_historical_option_quotes,
     run_historical_quotes_backtest,
 )
+from src.web.common import style_result
 
 
 def render(ticker, option_type, n_sims,
@@ -177,15 +178,7 @@ def render(ticker, option_type, n_sims,
                 'pnl_net': 'P&L ($)', 'result': 'Result'
             })
 
-            def _color_result(val):
-                if val == 'WIN':
-                    return 'color: #00FF00; font-weight: bold'
-                elif val == 'LOSS':
-                    return 'color: #FF4444; font-weight: bold'
-                return ''
-
-            st.subheader("Compact View", divider=False, anchor=None)
-            styled_compact = compact_df.style.map(_color_result, subset=['Result'])
+            styled_compact = compact_df.style.map(style_result, subset=['Result'])
             st.dataframe(styled_compact, width='stretch', hide_index=True, height=300)
 
             # --- Export trade log ---
@@ -214,7 +207,7 @@ def render(ticker, option_type, n_sims,
             # Detailed forensic view
             with st.expander("Detailed Forensic Analysis"):
                 st.markdown("*Complete trade record with costs, volatility, and sensitivity analysis*")
-                styled_trades = trades_df.style.map(_color_result, subset=['result'])
+                styled_trades = trades_df.style.map(style_result, subset=['result'])
                 st.dataframe(styled_trades, width='stretch', hide_index=True)
         else:
             st.info("No trades triggered. With SPX quote mode, the 100x contract multiplier, quote filters, and hedge reserve can make a small account ineligible even when edge exists.")

@@ -6,88 +6,31 @@ Handles the live options chain fetch, async API call to FastAPI backend,
 fallback local scan, diagnostics, and results display.
 """
 
-import streamlit as st
+import os
+
 import pandas as pd
 import plotly.graph_objects as go
 import requests
-import os
-from datetime import datetime
+import streamlit as st
 
-from src.core.data_fetcher import (
-    get_available_expirations,
-    get_market_data_runtime_summary,
-    get_options_chain,
-    get_risk_free_rate,
-    get_spot_and_vol,
-)
+from src.core.data_fetcher import get_market_data_runtime_summary, get_options_chain
 from src.core.model_evaluation import build_live_surface_evaluation
 from src.core.scanner_engine import scan_for_valuation_gaps
 from src.core.calibration_engine import calibrate_heston, calibrate_lsv
-
+from src.web.common import (
+    build_expiration_choices,
+    fetch_available_expirations,
+    fetch_risk_free_rate,
+    fetch_spot_data,
+    format_as_of_timestamp,
+    format_metric,
+    model_key,
+    spot_provenance_warning,
+    style_edge,
+    style_signal,
+)
 
 SCAN_API_URL = os.getenv("QUANT_TERMINAL_SCAN_API_URL", "http://127.0.0.1:8000/scan")
-
-@st.cache_data(ttl=300)
-def fetch_available_expirations(ticker):
-    return get_available_expirations(ticker)
-
-
-@st.cache_data(ttl=120)
-def fetch_spot_data(ticker):
-    return get_spot_and_vol(ticker)
-
-
-@st.cache_data(ttl=300)
-def fetch_risk_free_rate():
-    return get_risk_free_rate()
-
-
-def _style_signal(val):
-    if 'BUY' in str(val):
-        return 'color: #00FF00; font-weight: bold'
-    elif 'SELL' in str(val):
-        return 'color: #FF4444; font-weight: bold'
-    return 'color: #888888'
-
-
-def _style_edge(val):
-    try:
-        v = float(val)
-        if v > 0:
-            return 'color: #00FF00'
-        elif v < 0:
-            return 'color: #FF4444'
-    except Exception:
-        pass
-    return ''
-
-
-def _format_metric_value(value, fmt):
-    try:
-        numeric = float(value)
-    except (TypeError, ValueError):
-        return "n/a"
-    if pd.isna(numeric):
-        return "n/a"
-    return format(numeric, fmt)
-
-
-def _build_expiration_choices(available_exps):
-    today = datetime.now().date()
-    choices = []
-
-    for exp_str in available_exps:
-        try:
-            exp_date = datetime.strptime(exp_str, "%Y-%m-%d").date()
-            days_left = (exp_date - today).days
-            if days_left < 0:
-                continue
-            label = f"{exp_date.strftime('%d %b')}  ·  {days_left}d"
-            choices.append((label, exp_str, days_left))
-        except Exception:
-            continue
-
-    return choices
 
 
 def _run_local_scan(options_df, S0, r_live, scan_model, scanner_sims, default_vol,
@@ -120,34 +63,6 @@ def _extract_api_detail(response):
     return response.text
 
 
-def _format_as_of_timestamp(value):
-    if value is None:
-        return "n/a"
-    try:
-        return value.tz_convert("UTC").strftime("%Y-%m-%d %H:%M UTC")
-    except Exception:
-        try:
-            return value.strftime("%Y-%m-%d %H:%M")
-        except Exception:
-            return str(value)
-
-
-def _build_spot_metadata_warning(spot_data):
-    if not spot_data:
-        return ""
-
-    warning_parts = []
-    if spot_data.get("fallback_from"):
-        warning_parts.append(
-            f"spot/history fell back from {spot_data['fallback_from']} to {spot_data.get('provider', 'yfinance')}"
-        )
-    if spot_data.get("is_stale"):
-        warning_parts.append("spot/history snapshot is flagged stale")
-    if spot_data.get("validation_warnings"):
-        warning_parts.append("validation: " + " ".join(spot_data["validation_warnings"]))
-    return "; ".join(warning_parts)
-
-
 def render(ticker, model_type, default_vol, n_sims,
            jump_intensity, jump_mean, jump_std,
            heston_V0, heston_kappa, heston_theta, heston_xi, heston_rho):
@@ -166,9 +81,9 @@ def render(ticker, model_type, default_vol, n_sims,
         st.caption(
             f"Spot/history source: {spot_metadata.get('provider', 'yfinance')} "
             f"(requested {spot_metadata.get('requested_provider', spot_metadata.get('provider', 'yfinance'))}, "
-            f"as of {_format_as_of_timestamp(spot_metadata.get('as_of'))})"
+            f"as of {format_as_of_timestamp(spot_metadata.get('as_of'))})"
         )
-    provenance_warning = _build_spot_metadata_warning(spot_metadata)
+    provenance_warning = spot_provenance_warning(spot_metadata)
     if provenance_warning:
         st.warning(f"Spot/history provenance warning: {provenance_warning}")
     elif market_data_summary["provider_preference"] != "yfinance":
@@ -181,7 +96,7 @@ def render(ticker, model_type, default_vol, n_sims,
             help="Higher = more accurate but slower. 5,000 is a good balance.")
             
     available_exps = fetch_available_expirations(ticker)
-    expiration_choices = _build_expiration_choices(available_exps)
+    expiration_choices = build_expiration_choices(available_exps)
     
     with scan_col2:
         if expiration_choices:
@@ -332,17 +247,11 @@ def render(ticker, model_type, default_vol, n_sims,
         ctx4.metric("Contracts", f"{len(options_df)}")
         st.caption(
             f"Spot/Vol source: {spot_data.get('provider', 'yfinance')} "
-            f"(as of {_format_as_of_timestamp(spot_data.get('as_of'))})"
+            f"(as of {format_as_of_timestamp(spot_data.get('as_of'))})"
         )
         st.markdown("---")
 
-        model_map = {
-            "Standard GBM": "gbm",
-            "Jump Diffusion": "jump_diffusion",
-            "Heston (Stochastic Vol)": "heston",
-            "LSV (Local Stochastic Vol)": "lsv",
-        }
-        scan_model = model_map.get(model_type, "heston")
+        scan_model = model_key(model_type)
 
         # Prepare optional LSV leverage for explicit LSV model selection.
         lsv_leverage = None
@@ -483,18 +392,18 @@ def render(ticker, model_type, default_vol, n_sims,
 
         surface_eval = build_live_surface_evaluation(results_df, S0, r_live)
         st.markdown("---")
-        st.subheader("Model Evaluation")
+        st.subheader("Model Fit vs Live Quotes")
         st.caption(
-            "These are quote-based live-surface diagnostics. Use them to judge model quality before "
-            "leaning on synthetic backtest returns."
+            "Quote-based diagnostics: how closely the (calibrated) model reprices the live surface. "
+            "Judge model quality here before leaning on synthetic backtest returns."
         )
         if surface_eval.get("success"):
             ev1, ev2, ev3, ev4, ev5 = st.columns(5)
-            ev1.metric("Price MAE", f"${_format_metric_value(surface_eval['price_mae'], '.4f')}")
-            ev2.metric("Price RMSE", f"${_format_metric_value(surface_eval['price_rmse'], '.4f')}")
-            ev3.metric("IV MAE", f"{_format_metric_value(surface_eval['iv_mae_pct_pts'], '.2f')} pts")
-            ev4.metric("Within NBBO", f"{_format_metric_value(surface_eval['within_nbbo_pct'], '.1f')}%")
-            ev5.metric("Abs Error / Spread", f"{_format_metric_value(surface_eval['mean_abs_error_in_spreads'], '.2f')}x")
+            ev1.metric("Price MAE", f"${format_metric(surface_eval['price_mae'], '.4f')}")
+            ev2.metric("Price RMSE", f"${format_metric(surface_eval['price_rmse'], '.4f')}")
+            ev3.metric("IV MAE", f"{format_metric(surface_eval['iv_mae_pct_pts'], '.2f')} pts")
+            ev4.metric("Within NBBO", f"{format_metric(surface_eval['within_nbbo_pct'], '.1f')}%")
+            ev5.metric("Abs Error / Spread", f"{format_metric(surface_eval['mean_abs_error_in_spreads'], '.2f')}x")
 
             with st.expander("Why these metrics matter", expanded=False):
                 st.markdown(
@@ -507,6 +416,65 @@ def render(ticker, model_type, default_vol, n_sims,
                 )
         else:
             st.info(surface_eval.get("message", "Surface evaluation unavailable."))
+
+        with st.expander("Model fit detail (error vs spread, per-contract, table)"):
+            fit_df = results_df.copy()
+            fit_df["price_error"] = fit_df["mc_price"] - fit_df["mid"]
+            fit_df["abs_price_error"] = fit_df["price_error"].abs()
+            fit_df["label"] = (
+                fit_df["type"].astype(str) + " " + fit_df["strike"].astype(str)
+                + " · " + fit_df["expiration"].astype(str)
+            )
+
+            fit_col1, fit_col2 = st.columns(2)
+            with fit_col1:
+                st.caption("Absolute pricing error vs quoted spread (colored by days to expiry).")
+                fig_scatter = go.Figure(go.Scatter(
+                    x=fit_df["spread_pct"], y=fit_df["abs_price_error"], mode="markers",
+                    marker=dict(size=9, color=fit_df["T_days"], colorscale="Viridis",
+                                showscale=True, colorbar=dict(title="DTE")),
+                    text=fit_df["label"],
+                    hovertemplate="%{text}<br>Spread %: %{x:.2f}<br>Abs Error: %{y:.4f}<extra></extra>",
+                ))
+                fig_scatter.update_layout(xaxis_title="Quoted Spread (%)",
+                    yaxis_title="Absolute Price Error ($)", height=360,
+                    margin=dict(l=0, r=0, t=10, b=0))
+                st.plotly_chart(fig_scatter, width="stretch")
+
+            with fit_col2:
+                st.caption("Largest per-contract model-minus-market residuals.")
+                ranked = fit_df.sort_values("abs_price_error", ascending=False).head(12)
+                colors = ["#DC2626" if x > 0 else "#4F46E5" for x in ranked["price_error"]]
+                fig_err = go.Figure(go.Bar(
+                    x=ranked["label"], y=ranked["price_error"], marker_color=colors,
+                    hovertemplate="%{x}<br>Price Error: %{y:.4f}<extra></extra>",
+                ))
+                fig_err.update_layout(xaxis_title="Contract",
+                    yaxis_title="Model Price - Mid ($)", height=360,
+                    margin=dict(l=0, r=0, t=10, b=0))
+                st.plotly_chart(fig_err, width="stretch")
+
+            table_df = fit_df.copy()
+            table_df["error_in_spreads"] = (
+                table_df["abs_price_error"] / table_df["spread"].replace(0.0, pd.NA)
+            )
+            table_df["inside_nbbo"] = (
+                (table_df["mc_price"] >= table_df["bid"]) & (table_df["mc_price"] <= table_df["ask"])
+            ).map({True: "YES", False: "NO"})
+            table_df = table_df.sort_values("abs_price_error", ascending=False)
+            fit_cols = ["type", "strike", "expiration", "T_days", "bid", "ask", "mid",
+                        "mc_price", "price_error", "error_in_spreads", "inside_nbbo",
+                        "market_iv", "sigma_source"]
+            st.dataframe(
+                table_df[[c for c in fit_cols if c in table_df.columns]].rename(columns={
+                    "type": "Type", "strike": "Strike", "expiration": "Expires", "T_days": "DTE",
+                    "bid": "Bid", "ask": "Ask", "mid": "Mid", "mc_price": "Model Price",
+                    "price_error": "Error $", "error_in_spreads": "Error / Spread",
+                    "inside_nbbo": "Inside NBBO", "market_iv": "Market IV %",
+                    "sigma_source": "Sigma Source",
+                }),
+                width="stretch", height=360, hide_index=True,
+            )
 
         with st.expander("Scanner Diagnostics & Data Quality"):
             d1, d2, d3 = st.columns(3)
@@ -596,9 +564,9 @@ def render(ticker, model_type, default_vol, n_sims,
         })
 
         # Apply styling
-        styled = display_df.style.map(_style_signal, subset=['Signal'])
+        styled = display_df.style.map(style_signal, subset=['Signal'])
         if 'Edge %' in display_df.columns:
-            styled = styled.map(_style_edge, subset=['Edge %'])
+            styled = styled.map(style_edge, subset=['Edge %'])
 
         st.dataframe(styled, width='stretch', height=500, hide_index=True)
 
@@ -638,7 +606,7 @@ def render(ticker, model_type, default_vol, n_sims,
                 'signal': 'Signal', 'volume': 'Vol', 'openInterest': 'OI',
                 'market_iv': 'IV%', 'sigma_source': 'IV Source',
             })
-            detailed_styled = detailed_df.style.map(_style_signal, subset=['Signal'])
+            detailed_styled = detailed_df.style.map(style_signal, subset=['Signal'])
             st.dataframe(detailed_styled, width='stretch', hide_index=True)
 
         st.markdown("---")

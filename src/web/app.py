@@ -1,81 +1,63 @@
 """
-app.py 
+app.py
 
-Architecture:
+Streamlit entry point. Builds the shared sidebar state (ticker, model,
+Monte Carlo / Heston / jump parameters) and dispatches to four tabs:
+
     src/web/tabs/
-        tab_option_analysis.py  — Tab 1: Single option pricing & path simulation
-        tab_scanner.py          — Tab 2: Live valuation gap scanner (async FastAPI)
-        tab_model_validation.py — Tab 3: Quote-based live model validation
-        tab_backtester.py       — Tab 4: Historical backtest (Heston / Jump Diffusion)
-        tab_portfolio_risk.py   — Tab 5: 3D Gamma/Vanna/Vega vectorized surfaces
+        tab_option_analysis.py  — Single-option pricing, paths, Greeks
+        tab_scanner.py          — Valuation-gap scanner + live model-fit diagnostics
+        tab_backtester.py       — Historical SPX-quote research backtest
+        tab_portfolio_risk.py   — 3D Greek and market-IV surfaces
+
+Shared UI/data helpers live in src/web/common.py.
 """
 
 import streamlit as st
 import sys
 import os
-from datetime import timezone
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
 
 from src.core.data_fetcher import get_market_data_runtime_summary, get_spot_and_vol
 from src.core.heston_model import feller_condition
-from src.web.tabs import tab_option_analysis, tab_scanner, tab_model_validation, tab_backtester, tab_portfolio_risk
-
-
-def _format_as_of_timestamp(value):
-    if value is None:
-        return "n/a"
-    try:
-        timestamp = value
-        if getattr(timestamp, "tzinfo", None) is None:
-            timestamp = timestamp.tz_localize(timezone.utc)
-        else:
-            timestamp = timestamp.tz_convert(timezone.utc)
-        return timestamp.strftime("%Y-%m-%d %H:%M UTC")
-    except Exception:
-        return str(value)
+from src.web.common import format_as_of_timestamp
+from src.web.tabs import (
+    tab_option_analysis,
+    tab_scanner,
+    tab_backtester,
+    tab_portfolio_risk,
+)
 
 # ============================================================================
 # PAGE CONFIG & CSS
 # ============================================================================
 
 st.set_page_config(
-    page_title="Quant Research Terminal V2",
-    page_icon="",
+    page_title="Quant Research Terminal",
+    page_icon="📈",
     layout="wide",
     initial_sidebar_state="expanded"
 )
 
 st.markdown("""
     <style>
-    html, body, [class*="css"] {
-        font-family: 'Fira Code', 'Roboto Mono', 'Courier New', monospace !important;
+    .block-container { padding: 1.2rem 1.6rem 2rem; max-width: 1400px; }
+    div[data-testid="stMetricValue"] { font-size: 1.5rem; font-weight: 600; }
+    div[data-testid="stMetricLabel"] {
+        font-size: 0.75rem; text-transform: uppercase;
+        letter-spacing: 0.03em; color: #6B7280;
     }
-    .block-container {
-        padding-top: 1rem !important;
-        padding-bottom: 1rem !important;
-        padding-left: 1rem !important;
-        padding-right: 1rem !important;
-        max-width: 98% !important;
-    }
-    .stMetric {
-        background-color: #1e1e1e;
-        padding: 10px;
-        border-radius: 5px;
-        border: 1px solid #333;
-    }
-    div[data-testid="stMetricValue"] { font-size: 1.4rem !important; font-weight: bold; }
-    div[data-testid="stMetricLabel"] { color: #A0A0A0 !important; font-size: 0.8rem !important; text-transform: uppercase; }
-    .stTabs [data-baseweb="tab-list"] { gap: 10px; }
-    .stTabs [data-baseweb="tab"] { padding-top: 10px; padding-bottom: 10px; font-weight: bold; }
-    .dataframe { font-size: 0.85rem !important; }
+    .stTabs [data-baseweb="tab-list"] { gap: 2px; }
+    .stTabs [data-baseweb="tab"] { font-weight: 600; padding: 8px 14px; }
+    h1 { font-weight: 700; letter-spacing: -0.01em; }
     </style>
 """, unsafe_allow_html=True)
 
 st.markdown("""
-<h1 style='margin-bottom:0'>Quant Research Terminal V2</h1>
-<p style='color:#A0A0A0; margin-top:2px; font-size:0.9rem'>
-Black-Scholes &nbsp;|&nbsp; GBM Monte Carlo &nbsp;|&nbsp; Heston &nbsp;|&nbsp; Jump Diffusion &nbsp;|&nbsp; LSV
+<h1 style='margin-bottom:0'>Quant Research Terminal</h1>
+<p style='color:#6B7280; margin-top:4px; font-size:0.9rem'>
+Black-Scholes · GBM Monte Carlo · Heston · Jump Diffusion · LSV
 </p>
 """, unsafe_allow_html=True)
 
@@ -135,7 +117,7 @@ if asset_data:
                 f"requested provider: `{asset_data.get('requested_provider', 'n/a')}`",
                 f"resolved provider: `{asset_data.get('provider', 'n/a')}`",
                 f"fallback active: `{'yes' if asset_data.get('fallback_from') else 'no'}`",
-                f"as-of timestamp: `{_format_as_of_timestamp(asset_data.get('as_of'))}`",
+                f"as-of timestamp: `{format_as_of_timestamp(asset_data.get('as_of'))}`",
                 f"history points: `{asset_data.get('history_points', 0)}`",
                 f"stale flag: `{'yes' if asset_data.get('is_stale') else 'no'}`",
             ])
@@ -324,8 +306,8 @@ n_sims = st.sidebar.number_input(
 # TABS — delegate to modules
 # ============================================================================
 
-tab1, tab2, tab3, tab4, tab5 = st.tabs([
-    "Option Pricing", "Valuation Scanner", "Model Validation", "Backtester", "Risk Surfaces"
+tab1, tab2, tab3, tab4 = st.tabs([
+    "Option Analysis", "Valuation Scanner", "Backtester", "Risk Surfaces"
 ])
 
 with tab1:
@@ -348,15 +330,6 @@ with tab2:
     )
 
 with tab3:
-    tab_model_validation.render(
-        ticker=ticker, model_type=model_type,
-        default_vol=default_vol, n_sims=n_sims,
-        jump_intensity=jump_intensity, jump_mean=jump_mean, jump_std=jump_std,
-        heston_V0=heston_V0, heston_kappa=heston_kappa,
-        heston_theta=heston_theta, heston_xi=heston_xi, heston_rho=heston_rho
-    )
-
-with tab4:
     tab_backtester.render(
         ticker=ticker, option_type="call", n_sims=n_sims,
         jump_intensity=jump_intensity, jump_mean=jump_mean, jump_std=jump_std,
@@ -364,5 +337,5 @@ with tab4:
         heston_theta=heston_theta, heston_xi=heston_xi, heston_rho=heston_rho
     )
 
-with tab5:
+with tab4:
     tab_portfolio_risk.render(ticker=ticker, default_spot=default_spot, asset_data=asset_data)

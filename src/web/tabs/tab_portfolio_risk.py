@@ -19,41 +19,13 @@ import streamlit as st
 import numpy as np
 import plotly.graph_objects as go
 from scipy.interpolate import griddata
-from src.core.data_fetcher import get_market_data_runtime_summary, get_options_chain
 
-
-@st.cache_data(ttl=300)  # Cache for 5 minutes
-def fetch_cached_options_chain(ticker, max_expirations=10):
-    """Cached wrapper for options chain fetching with 5-minute TTL."""
-    return get_options_chain(ticker, max_expirations=max_expirations)
-
-
-def _format_as_of_timestamp(value):
-    if value is None:
-        return "n/a"
-    try:
-        return value.tz_convert("UTC").strftime("%Y-%m-%d %H:%M UTC")
-    except Exception:
-        try:
-            return value.strftime("%Y-%m-%d %H:%M")
-        except Exception:
-            return str(value)
-
-
-def _build_spot_provenance_warning(asset_data):
-    if not asset_data:
-        return ""
-
-    warning_parts = []
-    if asset_data.get("fallback_from"):
-        warning_parts.append(
-            f"spot defaults fell back from {asset_data['fallback_from']} to {asset_data.get('provider', 'yfinance')}"
-        )
-    if asset_data.get("is_stale"):
-        warning_parts.append("spot/history snapshot is flagged stale")
-    if asset_data.get("validation_warnings"):
-        warning_parts.append("validation: " + " ".join(asset_data["validation_warnings"]))
-    return "; ".join(warning_parts)
+from src.core.data_fetcher import get_market_data_runtime_summary
+from src.web.common import (
+    fetch_options_chain,
+    format_as_of_timestamp,
+    spot_provenance_warning,
+)
 
 
 def render(ticker, default_spot, asset_data=None):
@@ -149,12 +121,12 @@ def render(ticker, default_spot, asset_data=None):
         if asset_data:
             st.caption(
                 f"Spot/history requested: {asset_data.get('requested_provider', resolved_provider)} | "
-                f"as of {_format_as_of_timestamp(asset_data.get('as_of'))} | "
+                f"as of {format_as_of_timestamp(asset_data.get('as_of'))} | "
                 f"history points: {asset_data.get('history_points', 'n/a')}"
             )
         if market_data_summary["provider_preference"] != "yfinance":
             st.caption(market_data_summary["options_chain_note"])
-        spot_warning = _build_spot_provenance_warning(asset_data)
+        spot_warning = spot_provenance_warning(asset_data)
         if spot_warning:
             st.warning(f"Spot/default provenance warning: {spot_warning}")
 
@@ -167,7 +139,7 @@ def render(ticker, default_spot, asset_data=None):
 
         with st.spinner(f"Fetching market data for {ticker}..."):
             # Use cached fetch with 5-minute TTL
-            options_df = fetch_cached_options_chain(ticker, max_expirations=10)
+            options_df = fetch_options_chain(ticker, max_expirations=10)
 
         if options_df.empty:
             st.error(f"Could not fetch options chain for {ticker}.")
