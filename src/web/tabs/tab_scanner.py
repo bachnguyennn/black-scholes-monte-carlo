@@ -207,6 +207,19 @@ def render(ticker, model_type, default_vol, n_sims,
         scan_button = st.button("Run Scan", type="primary", width="stretch",
             help="Run the pricing engine to rank valuation gaps across the selected expirations.")
 
+    auto_calibrate = st.checkbox(
+        "Calibrate to the live surface before scanning (recommended)",
+        value=True,
+        help=(
+            "Fits the Heston/LSV parameters to today's market before pricing. "
+            "Without this, the model is priced with generic sidebar parameters, so a "
+            "reported 'valuation gap' mostly reflects the mismatch between those arbitrary "
+            "parameters and the market rather than a genuine mispricing. With calibration on, "
+            "a gap is the residual the fitted model cannot explain. Applies to the Heston and "
+            "LSV models."
+        ),
+    )
+
     if not selected_exps:
         st.warning(f"Please select at least one expiration date to scan {ticker}.")
         return
@@ -340,12 +353,42 @@ def render(ticker, model_type, default_vol, n_sims,
             lsv_strikes = st.session_state['lsv_strikes']
             lsv_mats = st.session_state['lsv_maturities']
 
+        # Effective Heston parameters. For the Heston/LSV models we fit them to
+        # the live surface first (when calibration is enabled), so the pricing
+        # model reflects the market rather than generic sidebar defaults, and a
+        # reported valuation gap is a genuine post-calibration residual.
+        eff_V0, eff_kappa, eff_theta = heston_V0, heston_kappa, heston_theta
+        eff_xi, eff_rho = heston_xi, heston_rho
+        calib_summary = None
+        if auto_calibrate and scan_model in ("heston", "lsv"):
+            with st.spinner("Calibrating Heston to the live surface before scanning..."):
+                calib = calibrate_heston(options_df, S0, r_live, q=0.0)
+            if calib.get('success'):
+                eff_V0 = calib['V0']
+                eff_kappa = calib['kappa']
+                eff_theta = calib['theta']
+                eff_xi = calib['xi']
+                eff_rho = calib['rho']
+                calib_summary = calib
+                # Persist so the sidebar reflects the fitted parameters too.
+                st.session_state['heston_V0'] = calib['V0']
+                st.session_state['heston_kappa'] = calib['kappa']
+                st.session_state['heston_theta'] = calib['theta']
+                st.session_state['heston_xi'] = calib['xi']
+                st.session_state['heston_rho'] = calib['rho']
+            else:
+                st.warning(
+                    f"Calibration did not converge ({calib.get('message', 'unknown reason')}). "
+                    "Scanning with the current sidebar parameters instead — valuation gaps will "
+                    "partly reflect parameter mismatch rather than pure mispricing."
+                )
+
         payload = {
             "ticker": ticker, "r": r_live, "q": 0.0, "model": scan_model,
             "n_sims": scanner_sims,
             "jump_intensity": jump_intensity, "jump_mean": jump_mean, "jump_std": jump_std,
-            "heston_V0": heston_V0, "heston_kappa": heston_kappa,
-            "heston_theta": heston_theta, "heston_xi": heston_xi, "heston_rho": heston_rho,
+            "heston_V0": eff_V0, "heston_kappa": eff_kappa,
+            "heston_theta": eff_theta, "heston_xi": eff_xi, "heston_rho": eff_rho,
             "max_spread_pct": 0.25,
             "options_data": options_df.to_dict(orient="records"),
             "spot": S0, "historical_vol": hist_vol
@@ -371,7 +414,7 @@ def render(ticker, model_type, default_vol, n_sims,
                     results_df, scan_diagnostics = _run_local_scan(
                         options_df, S0, r_live, scan_model, scanner_sims, default_vol,
                         jump_intensity, jump_mean, jump_std,
-                        heston_V0, heston_kappa, heston_theta, heston_xi, heston_rho,
+                        eff_V0, eff_kappa, eff_theta, eff_xi, eff_rho,
                         lsv_leverage, lsv_strikes, lsv_mats,
                         engine_label='local_after_api_no_data'
                     )
@@ -386,7 +429,7 @@ def render(ticker, model_type, default_vol, n_sims,
                     results_df, scan_diagnostics = _run_local_scan(
                         options_df, S0, r_live, scan_model, scanner_sims, default_vol,
                         jump_intensity, jump_mean, jump_std,
-                        heston_V0, heston_kappa, heston_theta, heston_xi, heston_rho,
+                        eff_V0, eff_kappa, eff_theta, eff_xi, eff_rho,
                         lsv_leverage, lsv_strikes, lsv_mats,
                         engine_label='local_fallback'
                     )
@@ -414,6 +457,29 @@ def render(ticker, model_type, default_vol, n_sims,
         sig2.metric("[ BUY ]", buys)
         sig3.metric("[ SELL ]", sells)
         sig4.metric("[ HOLD ]", holds)
+
+        if calib_summary is not None:
+            feller = calib_summary.get('feller', {})
+            st.markdown("---")
+            st.subheader("Calibrated Heston Parameters")
+            st.caption(
+                "Fitted to the live implied-volatility surface before pricing. The valuation gaps "
+                "below are residuals the calibrated model could not fit — candidate mispricings, "
+                "not a mismatch between arbitrary defaults and the market."
+            )
+            cp = st.columns(6)
+            cp[0].metric("κ (kappa)", f"{calib_summary['kappa']:.3f}")
+            cp[1].metric("θ (theta)", f"{calib_summary['theta']:.4f}")
+            cp[2].metric("ξ (xi)", f"{calib_summary['xi']:.3f}")
+            cp[3].metric("ρ (rho)", f"{calib_summary['rho']:.3f}")
+            cp[4].metric("V₀", f"{calib_summary['V0']:.4f}")
+            cp[5].metric("Fit SSE (IV)", f"{calib_summary['sse']:.2e}")
+            st.caption(f"Calibrated on {calib_summary.get('n_contracts', '?')} contracts.")
+            if not feller.get('satisfied', True):
+                st.warning(
+                    "Feller condition violated at the fitted parameters (2κθ ≤ ξ²): the variance "
+                    "process can reach zero, so treat deep-tail prices with caution."
+                )
 
         surface_eval = build_live_surface_evaluation(results_df, S0, r_live)
         st.markdown("---")
