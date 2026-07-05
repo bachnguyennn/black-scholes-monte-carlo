@@ -9,7 +9,10 @@ and can optionally return structured diagnostics.
 
 import numpy as np
 import pandas as pd
-from src.core.jump_diffusion import simulate_jump_diffusion
+from src.core.jump_diffusion import (
+    simulate_jump_diffusion,
+    simulate_jump_diffusion_antithetic,
+)
 from src.core.black_scholes import black_scholes_price
 from src.core.heston_model import price_option_heston_fourier
 from src.core.lsv_model import simulate_lsv_paths
@@ -54,9 +57,22 @@ def _initialize_scan_diagnostics(total_contracts, model, max_spread_pct, sigma_f
 
 
 def price_single_option_mc(S0, K, T, r, sigma, option_type, n_sims=10000,
-                           jump_intensity=0.1, jump_mean=-0.05, jump_std=0.03):
+                           jump_intensity=0.1, jump_mean=-0.05, jump_std=0.03,
+                           q=0.0):
     """
-    Prices a single option using Jump Diffusion Monte Carlo.
+    Prices a single option using Jump Diffusion Monte Carlo with two
+    variance-reduction techniques applied together:
+
+      - Antithetic variates: terminal prices are drawn in +Z / -Z pairs, so
+        the sampling error of the mean is damped by their negative correlation.
+      - Control variate: the Black-Scholes payoff evaluated on the same
+        Brownian path (jumps removed) is strongly correlated with the
+        jump-diffusion payoff and has a known discounted expectation -- the
+        exact Black-Scholes price. Subtracting beta * (control - BS_price)
+        removes the part of the payoff error explained by that control.
+
+    Together these typically cut the standard error several-fold versus naive
+    Monte Carlo at the same number of paths, at negligible extra cost.
 
     Inputs:
         S0: Spot price (float)
@@ -65,35 +81,58 @@ def price_single_option_mc(S0, K, T, r, sigma, option_type, n_sims=10000,
         r: Risk-free rate (float)
         sigma: Volatility (float)
         option_type: 'call' or 'put' (str)
-        n_sims: Number of simulations (int)
+        n_sims: Total number of terminal-price samples (int)
         jump_intensity: Crash intensity lambda (float)
         jump_mean: Average crash size (float, negative)
         jump_std: Crash volatility (float)
+        q: Continuous dividend yield (float)
 
     Output:
-        dict with 'mc_price' and 'bs_price'
+        dict with 'mc_price', 'bs_price', and 'std_error' (of the estimator)
     """
-    # Monte Carlo (Jump Diffusion)
-    S_T, _ = simulate_jump_diffusion(
-        S0, T, r, sigma, n_sims,
+    # Black-Scholes value: reported for comparison AND used as the known mean
+    # of the control variate.
+    bs_price_val = black_scholes_price(S0, K, T, r, sigma, option_type=option_type, q=q)
+
+    # Antithetic pairs: n_pairs pairs give 2*n_pairs samples for a comparable
+    # budget to n_sims naive paths.
+    n_pairs = max(1, n_sims // 2)
+    S_jd_p, S_jd_m, S_bs_p, S_bs_m = simulate_jump_diffusion_antithetic(
+        S0, T, r, sigma, n_pairs,
         jump_intensity=jump_intensity,
         jump_mean=jump_mean,
-        jump_std=jump_std
+        jump_std=jump_std,
+        q=q,
     )
 
+    disc = np.exp(-r * T)
     if option_type == 'call':
-        payoffs = np.maximum(S_T - K, 0)
+        jd_payoff = lambda s: np.maximum(s - K, 0.0)
     else:
-        payoffs = np.maximum(K - S_T, 0)
+        jd_payoff = lambda s: np.maximum(K - s, 0.0)
 
-    mc_price = float(np.exp(-r * T) * np.mean(payoffs))
+    # Pool the antithetic legs to estimate the control coefficient beta.
+    Y = disc * np.concatenate((jd_payoff(S_jd_p), jd_payoff(S_jd_m)))   # target
+    C = disc * np.concatenate((jd_payoff(S_bs_p), jd_payoff(S_bs_m)))   # control
+    var_C = np.var(C)
+    beta = np.cov(Y, C, bias=True)[0, 1] / var_C if var_C > 1e-12 else 0.0
 
-    # Black-Scholes (for comparison)
-    bs_price_val = black_scholes_price(S0, K, T, r, sigma, option_type=option_type)
+    # Control-adjusted payoff on each leg; the control's known mean is the
+    # exact Black-Scholes price.
+    adj_p = disc * jd_payoff(S_jd_p) - beta * (disc * jd_payoff(S_bs_p) - bs_price_val)
+    adj_m = disc * jd_payoff(S_jd_m) - beta * (disc * jd_payoff(S_bs_m) - bs_price_val)
+
+    # Antithetic estimator: average each +Z/-Z pair, then average over the
+    # independent pairs. This yields a correct standard error that reflects
+    # the negative within-pair correlation.
+    pair_means = 0.5 * (adj_p + adj_m)
+    mc_price = max(float(np.mean(pair_means)), 0.0)
+    std_error = float(np.std(pair_means, ddof=1) / np.sqrt(len(pair_means)))
 
     return {
         'mc_price': mc_price,
-        'bs_price': bs_price_val
+        'bs_price': bs_price_val,
+        'std_error': std_error,
     }
 
 

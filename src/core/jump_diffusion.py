@@ -98,6 +98,81 @@ def simulate_jump_diffusion(S0, T, r, sigma, n_sims,
 
 
 @njit(fastmath=True)
+def simulate_jump_diffusion_antithetic(S0, T, r, sigma, n_pairs,
+                                       jump_intensity=0.1,
+                                       jump_mean=-0.05,
+                                       jump_std=0.03,
+                                       n_steps=1,
+                                       q=0.0,
+                                       seed=-1):
+    """
+    Simulates terminal prices in antithetic pairs for variance reduction.
+
+    For each of the n_pairs draws, the Gaussian shocks (both the diffusion
+    Brownian increment and the jump-size normals) are used with sign +Z and
+    -Z, producing two negatively-correlated terminal prices from one set of
+    random numbers. The Poisson jump *counts* are shared across the pair
+    (counts cannot be antithetically mirrored), so the reduction comes from
+    the dominant continuous component and the jump magnitudes.
+
+    The same Brownian path is also evolved with no jumps and no jump
+    compensator to give a pure-GBM terminal price. That price makes an
+    excellent control variate: it is strongly correlated with the
+    jump-diffusion payoff and its discounted expectation is exactly the
+    Black-Scholes value.
+
+    Returns:
+        S_T_plus  : jump-diffusion terminal prices using +Z, shape (n_pairs,)
+        S_T_minus : jump-diffusion terminal prices using -Z, shape (n_pairs,)
+        S_bs_plus : pure-GBM terminal prices using +Z (control), shape (n_pairs,)
+        S_bs_minus: pure-GBM terminal prices using -Z (control), shape (n_pairs,)
+    """
+    if seed != -1:
+        np.random.seed(seed)
+
+    dt = T / n_steps
+    jump_comp = jump_intensity * (np.exp(jump_mean + 0.5 * jump_std**2) - 1.0)
+    gbm_drift = (r - q - 0.5 * sigma**2) * dt          # pure GBM (control)
+    jd_drift = gbm_drift - jump_comp * dt              # jump-compensated
+    diffusion_std = sigma * np.sqrt(dt)
+
+    S_T_plus = np.empty(n_pairs)
+    S_T_minus = np.empty(n_pairs)
+    S_bs_plus = np.empty(n_pairs)
+    S_bs_minus = np.empty(n_pairs)
+
+    for i in range(n_pairs):
+        log_jd_p = np.log(S0)
+        log_jd_m = np.log(S0)
+        log_bs_p = np.log(S0)
+        log_bs_m = np.log(S0)
+        for t in range(n_steps):
+            Z = np.random.randn()
+            n_jumps = np.random.poisson(jump_intensity * dt)
+            if n_jumps > 0:
+                Zj = np.random.randn()
+                mag = Zj * jump_std * np.sqrt(n_jumps) + jump_mean * n_jumps
+                mag_anti = -Zj * jump_std * np.sqrt(n_jumps) + jump_mean * n_jumps
+            else:
+                mag = 0.0
+                mag_anti = 0.0
+
+            diff_p = diffusion_std * Z
+            diff_m = -diffusion_std * Z
+            log_jd_p += jd_drift + diff_p + mag
+            log_jd_m += jd_drift + diff_m + mag_anti
+            log_bs_p += gbm_drift + diff_p
+            log_bs_m += gbm_drift + diff_m
+
+        S_T_plus[i] = np.exp(log_jd_p)
+        S_T_minus[i] = np.exp(log_jd_m)
+        S_bs_plus[i] = np.exp(log_bs_p)
+        S_bs_minus[i] = np.exp(log_bs_m)
+
+    return S_T_plus, S_T_minus, S_bs_plus, S_bs_minus
+
+
+@njit(fastmath=True)
 def simulate_jump_diffusion_paths(S0, T, r, sigma, n_paths,
                                    jump_intensity=0.1,
                                    jump_mean=-0.05,
