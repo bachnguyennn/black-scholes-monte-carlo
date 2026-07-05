@@ -338,21 +338,51 @@ It also exposes the strategy controls used in Section 9.4: a **strategy side** (
 
 ### 9.1 Model Convergence
 
-GBM Monte Carlo prices converge to BSM analytical values within statistical tolerance. At $N = 100{,}000$ paths, the standard error is consistently below $0.01$ for typical parameter configurations, confirming the numerical correctness of the simulation engine.
+GBM Monte Carlo prices converge to the Black-Scholes-Merton analytical value ($10.4506$ for the reference at-the-money call: $S_0=K=100$, $T=1$, $r=0.05$, $\sigma=0.20$). The standard error falls as $O(1/\sqrt{N})$—dropping by a factor of $\sqrt{10}\approx 3.16$ for each tenfold increase in paths, from $0.46$ at $10^3$ paths to $0.015$ at $10^6$ (Table 1). Single-run absolute errors are noisier, since each row is one sampled path set, but remain within roughly two standard errors throughout, confirming the estimator is unbiased.
 
-[INSERT TABLE 1: GBM Monte Carlo convergence against BSM with columns for $N$, Monte Carlo price, BSM price, absolute error, and standard error]
+**Table 1: GBM Monte Carlo convergence to the BSM benchmark** (reference ATM call, BSM = $10.4506$).
+
+| $N$ paths | MC Price | Abs Error | Std Error |
+|---|---|---|---|
+| 1,000 | 10.5461 | 0.0955 | 0.4557 |
+| 10,000 | 10.4510 | 0.0004 | 0.1477 |
+| 100,000 | 10.4472 | 0.0033 | 0.0464 |
+| 500,000 | 10.4889 | 0.0383 | 0.0208 |
+| 1,000,000 | 10.4628 | 0.0122 | 0.0147 |
 
 ### 9.2 Heston Calibration Quality
 
-When calibrated to live SPX options chains, the Heston model achieves SSE values on the order of $10^{-4}$ to $10^{-3}$ across 50–200 liquid contracts. The Feller condition is satisfied for typical equity calibrations ($\kappa \approx 2$, $\theta \approx 0.04$, $\xi \approx 0.3$), confirming the variance process is well-posed.
+The two-stage global calibration—a low-discrepancy Sobol scan followed by an SLSQP polish—fits the Heston parameters to a live SPX surface. On a representative stressed date (27 October 2011, spot 1284, drawn from the historical CBOE dataset), it achieves an implied-volatility sum-of-squared-errors of $4.4\times10^{-3}$ across 40 well-spread contracts subsampled from the liquid chain, with the Feller condition satisfied ($2\kappa\theta - \xi^2 = 0.018 > 0$). The fitted parameters exhibit fast mean reversion ($\kappa=6.4$) and elevated vol-of-vol ($\xi=0.63$), characteristic of a post-selloff regime, together with the strong negative spot–vol correlation ($\rho=-0.70$) typical of equity index options (Table 2).
 
-[INSERT TABLE 2: Heston calibration metrics with SSE, contract count, calibrated parameters, and Feller discriminant]
+**Table 2: Heston calibration to a live SPX surface** (27 October 2011, spot 1284).
+
+| Metric | Value |
+|---|---|
+| Contracts used | 40 (subsampled from liquid chain) |
+| $\kappa$ (mean reversion) | 6.45 |
+| $\theta$ (long-run variance) | 0.0324 |
+| $\xi$ (vol of vol) | 0.632 |
+| $\rho$ (spot–vol correlation) | −0.702 |
+| $V_0$ (initial variance) | 0.0464 |
+| SSE (implied-vol space) | $4.37\times10^{-3}$ |
+| Feller $2\kappa\theta-\xi^2$ | 0.0184 (satisfied) |
 
 ### 9.3 Scanner Performance
 
-The Fourier-based Heston pricer processes entire options chains in under 5 seconds (versus several minutes for Monte Carlo), enabling real-time scanning. The scanner's bid-ask-aware signal logic (BUY when model price > ask; SELL when model price < bid) eliminates phantom edges that midpoint-only analysis would produce.
+The Fourier-based Heston pricer, using a fixed 128-node Gauss-Legendre rule, values a single option in roughly 0.1 ms—over four orders of magnitude faster than the 252-step Monte Carlo pricer—so an entire multi-hundred-contract chain is repriced in a fraction of a second, enabling interactive scanning. The scanner's bid-ask-aware signal logic (BUY when the model price exceeds the ask; SELL when it falls below the bid) eliminates the phantom edges that midpoint-only analysis produces, and, when calibration is enabled, prices against parameters fitted to the same surface so a reported gap is a genuine residual rather than a parameter mismatch.
 
-[INSERT TABLE 3: Scanner validation metrics with price MAE, price RMSE, IV MAE, NBBO coverage, and mean error in spreads]
+Against the 27 October 2011 surface, the calibrated model reprices 393 contracts with a price MAE of \$1.73 and an implied-volatility MAE of 5.1 volatility points; 68% of model prices fall inside the quoted bid–ask, and the mean absolute pricing error is 0.53× the quoted spread—smaller than the trading friction itself (Table 3). The residual IV error reflects the known limitation that a single Heston parameter set cannot perfectly fit an entire multi-maturity smile, which is precisely the motivation for the LSV extension (Section 9.5).
+
+**Table 3: Calibrated-model fit against live quotes** (27 October 2011 SPX surface, 393 contracts).
+
+| Metric | Value |
+|---|---|
+| Contracts evaluated | 393 |
+| Price MAE | \$1.73 |
+| Price RMSE | \$2.85 |
+| IV MAE | 5.09 vol pts |
+| Within NBBO | 68.4% |
+| Mean abs error / spread | 0.53× |
 
 ### 9.4 Backtester Insights
 
