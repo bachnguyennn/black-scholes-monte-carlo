@@ -438,7 +438,7 @@ def render(ticker, model_type, default_vol, n_sims,
                 ))
                 fig_scatter.update_layout(xaxis_title="Quoted Spread (%)",
                     yaxis_title="Absolute Price Error ($)", height=360,
-                    margin=dict(l=0, r=0, t=10, b=0))
+                    margin=dict(l=0, r=0, t=10, b=0), template="plotly_white")
                 st.plotly_chart(fig_scatter, width="stretch")
 
             with fit_col2:
@@ -451,7 +451,7 @@ def render(ticker, model_type, default_vol, n_sims,
                 ))
                 fig_err.update_layout(xaxis_title="Contract",
                     yaxis_title="Model Price - Mid ($)", height=360,
-                    margin=dict(l=0, r=0, t=10, b=0))
+                    margin=dict(l=0, r=0, t=10, b=0), template="plotly_white")
                 st.plotly_chart(fig_err, width="stretch")
 
             table_df = fit_df.copy()
@@ -615,12 +615,12 @@ def render(ticker, model_type, default_vol, n_sims,
         if top_n > 0:
             topN = filtered_df.head(top_n).copy()
             topN['label'] = topN['type'] + ' ' + topN['strike'].astype(str) + ' (' + topN['expiration'] + ')'
-            colors = ['#00FF00' if e > 0 else '#FF4444' for e in topN['edge_pct']]
+            colors = ['#16A34A' if e > 0 else '#DC2626' for e in topN['edge_pct']]
             fig_bar = go.Figure()
             fig_bar.add_trace(go.Bar(x=topN['label'], y=topN['edge_pct'],
                 marker_color=colors, text=topN['signal'], textposition='outside'))
             fig_bar.update_layout(xaxis_title="Contract", yaxis_title="Edge (%)",
-                height=380, margin=dict(l=0, r=0, t=20, b=0))
+                height=380, margin=dict(l=0, r=0, t=20, b=0), template="plotly_white")
         st.plotly_chart(fig_bar, width='stretch')
 
     else:

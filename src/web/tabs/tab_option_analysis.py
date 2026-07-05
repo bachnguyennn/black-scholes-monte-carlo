@@ -165,7 +165,7 @@ def render(ticker, asset_data, model_type, n_sims,
         history = asset_data['history']
         x_hist = np.linspace(-len(history) / 252, 0, len(history))
         fig_paths.add_trace(go.Scatter(x=x_hist, y=history.values, mode='lines',
-            name='Historical', line=dict(color='#00FF00', width=2)))
+            name='Historical', line=dict(color='#4F46E5', width=2)))
 
     for i in range(n_plot_paths):
         if model_type in {"Heston (Stochastic Vol)", "LSV (Local Stochastic Vol)"}:
@@ -181,6 +181,7 @@ def render(ticker, asset_data, model_type, n_sims,
     fig_paths.update_layout(
         xaxis_title="Years", yaxis_title="Price ($)", height=400,
         hovermode="x unified", margin=dict(l=0, r=0, t=20, b=0),
+        template="plotly_white",
         plot_bgcolor='rgba(0,0,0,0)', paper_bgcolor='rgba(0,0,0,0)')
     st.plotly_chart(fig_paths, width='stretch')
 
@@ -219,7 +220,7 @@ def render(ticker, asset_data, model_type, n_sims,
     fig_hist = px.histogram(S_T, nbins=50)
     fig_hist.add_vline(x=strike_price, line_dash="dash", line_color="red")
     fig_hist.update_layout(xaxis_title="Price at Maturity", yaxis_title="Freq",
-        height=350, margin=dict(l=0, r=0, t=20, b=0))
+        height=350, margin=dict(l=0, r=0, t=20, b=0), template="plotly_white")
     st.plotly_chart(fig_hist, width='stretch')
 
     st.markdown("---")

@@ -154,11 +154,11 @@ def render(ticker, option_type, n_sims,
             fig_eq.add_trace(go.Scatter(
                 x=equity_df['date'], y=equity_df['net_value'],
                 mode='lines+markers', name='Net Portfolio',
-                line=dict(color='#00FF00', width=2), marker=dict(size=4)))
-            fig_eq.add_hline(y=bt_capital, line_dash="dash", line_color="gray",
+                line=dict(color='#16A34A', width=2), marker=dict(size=4)))
+            fig_eq.add_hline(y=bt_capital, line_dash="dash", line_color="#9CA3AF",
                 annotation_text=f"Start: ${bt_capital:,.0f}")
             fig_eq.update_layout(xaxis_title="Date", yaxis_title="Value ($)",
-                height=380, margin=dict(l=0, r=0, t=20, b=0))
+                height=380, margin=dict(l=0, r=0, t=20, b=0), template="plotly_white")
             st.plotly_chart(fig_eq, width='stretch')
 
         st.markdown("---")
