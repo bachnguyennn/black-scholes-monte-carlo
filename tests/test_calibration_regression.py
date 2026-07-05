@@ -80,6 +80,31 @@ def test_calibrate_heston_fits_synthetic_surface():
     assert abs(result['rho'] - true_params['rho']) < 0.2
 
 
+def test_global_search_fits_from_a_bad_start():
+    """The global scan should reach a good surface fit even when seeded with
+    an initial guess far from the truth -- the case where a single-start
+    local optimizer is most likely to stall in a bad basin."""
+    options_df, S0, r, q, _ = _synthetic_heston_surface()
+
+    far_start = {
+        'kappa': 0.5,
+        'theta': 0.20,
+        'xi': 1.20,
+        'rho': -0.10,
+        'V0': 0.20,
+    }
+
+    result = calibrate_heston(
+        options_df, S0, r, q=q,
+        initial_params=far_start,
+        global_search=True,
+    )
+
+    assert result['success'] is True
+    # Fit quality must not depend on the (bad) starting point.
+    assert result['sse'] < 1e-3
+
+
 def test_calibrate_heston_rejects_too_few_contracts():
     options_df, S0, r, q, _ = _synthetic_heston_surface()
     insufficient_df = options_df.iloc[:4].copy()

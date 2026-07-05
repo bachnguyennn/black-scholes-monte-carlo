@@ -10,16 +10,22 @@ Objective:
     SSE = sum_i w_i * (IV_market(K_i, T_i) - IV_heston(K_i, T_i | params))^2
 
 Optimizer:
-    scipy.optimize.minimize with SLSQP method to respect parameter bounds.
+    Two-stage global calibration to escape the many local minima of the
+    Heston objective:
+      1. Global search with scipy.optimize.differential_evolution in
+         price space (fast: no per-evaluation implied-vol inversion).
+      2. Local polish with SLSQP in implied-vol space (accurate and the
+         quantity actually reported as SSE).
     Bounds: kappa > 0, theta > 0, xi > 0, -1 < rho < 0, V0 > 0
 
 Reference:
-    Heston (1993); Gatheral (2006) "The Volatility Surface"
+    Heston (1993); Gatheral (2006) "The Volatility Surface";
+    Mikhailov & Nogel (2003) on Heston calibration and local minima.
 """
 
 import numpy as np
-from scipy.optimize import minimize
-from scipy.stats import norm
+from scipy.optimize import minimize, brentq
+from scipy.stats import norm, qmc
 
 from src.core.heston_model import price_option_heston_fourier, feller_condition
 from src.core.black_scholes import black_scholes_price
@@ -47,23 +53,26 @@ def _implied_vol_from_price(price, S0, K, T, r, option_type='call', q=0.0):
 
     lo, hi = 1e-4, 5.0
 
-    for _ in range(100):
-        mid = (lo + hi) / 2.0
-        bs = black_scholes_price(S0, K, T, r, mid, option_type, q=q)
-        if bs < price:
-            lo = mid
-        else:
-            hi = mid
-        if hi - lo < 1e-6:
-            break
+    # BS price is strictly increasing in sigma, so brentq converges fast on the
+    # root of (BS(sigma) - price). Requires a sign change across [lo, hi].
+    def f(sigma):
+        return black_scholes_price(S0, K, T, r, sigma, option_type, q=q) - price
 
-    iv = (lo + hi) / 2.0
+    try:
+        if f(lo) * f(hi) > 0:
+            return float('nan')
+        iv = brentq(f, lo, hi, xtol=1e-8, maxiter=100)
+    except Exception:
+        return float('nan')
+
     return iv if 0.001 < iv < 4.9 else float('nan')
 
 
 def calibrate_heston(options_df, S0, r, q=0.0,
                      initial_params=None,
-                     atm_moneyness_bounds=(0.80, 1.20)):
+                     atm_moneyness_bounds=(0.80, 1.20),
+                     global_search=True,
+                     seed=42):
     """
     Calibrates Heston parameters to a live options chain DataFrame.
 
@@ -80,6 +89,10 @@ def calibrate_heston(options_df, S0, r, q=0.0,
                         If None, sensible defaults are used.
         atm_moneyness_bounds: tuple (lo, hi) -- only calibrate to options
                         within this moneyness range (default 80%-120%)
+        global_search: if True, run a differential-evolution global search
+                        before the SLSQP polish (robust to local minima).
+                        If False, polish directly from initial_params.
+        seed        : RNG seed for the global search (reproducibility)
 
     Output:
         dict with:
@@ -106,11 +119,12 @@ def calibrate_heston(options_df, S0, r, q=0.0,
             'n_contracts': len(calib_df)
         }
 
-    # Build calibration targets (market IVs)
+    # Build calibration targets (market IVs and market prices)
     strikes = calib_df['strike'].values
     maturities = calib_df['T'].values
     opt_types = calib_df['type'].str.lower().values
     market_ivs = calib_df['market_iv'].values
+    market_prices = calib_df['mid'].values
 
     # Only use contracts where market IV is meaningful
     valid = (market_ivs > 0.01) & (market_ivs < 3.0)
@@ -118,6 +132,7 @@ def calibrate_heston(options_df, S0, r, q=0.0,
     maturities = maturities[valid]
     opt_types = opt_types[valid]
     market_ivs = market_ivs[valid]
+    market_prices = market_prices[valid]
 
     if len(strikes) < 5:
         return {
@@ -125,6 +140,19 @@ def calibrate_heston(options_df, S0, r, q=0.0,
             'message': f"Insufficient valid market IVs after cleaning: {len(strikes)} contracts.",
             'n_contracts': len(strikes)
         }
+
+    # Cap the calibration set. Five Heston parameters are pinned down by a few
+    # dozen well-spread quotes; pricing hundreds of contracts on every global
+    # -search evaluation is wasteful and dominates runtime. Sub-sample evenly
+    # across the (already ordered) chain to keep a representative spread.
+    MAX_CALIB_CONTRACTS = 40
+    if len(strikes) > MAX_CALIB_CONTRACTS:
+        idx = np.linspace(0, len(strikes) - 1, MAX_CALIB_CONTRACTS).astype(int)
+        strikes = strikes[idx]
+        maturities = maturities[idx]
+        opt_types = opt_types[idx]
+        market_ivs = market_ivs[idx]
+        market_prices = market_prices[idx]
 
     # Weight: higher volume contracts matter more (use moneyness-based weights)
     moneyness = strikes / S0
@@ -148,7 +176,34 @@ def calibrate_heston(options_df, S0, r, q=0.0,
     # Parameter bounds: kappa, theta, xi > 0; -1 < rho < 0; V0 > 0
     bounds = [(0.1, 20.0), (0.001, 2.0), (0.05, 3.0), (-0.999, -0.001), (0.0001, 2.0)]
 
-    def objective(params):
+    def price_objective(params):
+        """Fast objective for the global search: weighted relative price error.
+
+        Avoids the per-contract implied-vol inversion, so each evaluation is
+        one Fourier price per contract instead of a Fourier price *and* a
+        root-solve. Used only to locate a good basin for the polish.
+        """
+        kappa, theta, xi, rho, V0 = params
+        err = 0.0
+        for i in range(len(strikes)):
+            try:
+                heston_price = price_option_heston_fourier(
+                    S0, strikes[i], maturities[i], r,
+                    V0, kappa, theta, xi, rho,
+                    option_type=opt_types[i], q=q
+                )
+                denom = market_prices[i] if market_prices[i] > 1e-4 else 1e-4
+                err += weights[i] * ((heston_price - market_prices[i]) / denom) ** 2
+            except Exception:
+                err += weights[i] * 1.0
+        return err
+
+    def iv_objective(params):
+        """Accurate objective: weighted SSE in implied-vol space.
+
+        This is the quantity reported as `sse`, and what the SLSQP polish
+        minimizes once the global search has found a good basin.
+        """
         kappa, theta, xi, rho, V0 = params
         sse = 0.0
         for i in range(len(strikes)):
@@ -169,12 +224,54 @@ def calibrate_heston(options_df, S0, r, q=0.0,
                 sse += weights[i] * 1.0
         return sse
 
-    result = minimize(
-        objective, x0,
-        method='SLSQP',
-        bounds=bounds,
-        options={'maxiter': 500, 'ftol': 1e-9}
-    )
+    lows = np.array([b[0] for b in bounds])
+    highs = np.array([b[1] for b in bounds])
+    x0_clamped = np.clip(np.array(x0, dtype=float), lows, highs)
+
+    # Stage 1: global scan. A low-discrepancy Sobol sweep of the parameter
+    # box (plus the user's guess) locates promising basins with a fixed,
+    # bounded number of cheap price-space evaluations -- unlike a full
+    # differential-evolution run, whose thousands of Fourier calls are
+    # prohibitively slow in the Feller-violating regions it explores.
+    # The scan samples a realistic equity-index Heston box, not the full
+    # optimizer bounds. The extreme corners (tiny kappa, huge xi/theta)
+    # make the Fourier integrand oscillatory and the quadrature very slow,
+    # and they are not credible calibrations anyway. The SLSQP polish is
+    # still free to leave this box within the full `bounds`.
+    scan_bounds = [(0.5, 8.0), (0.01, 0.40), (0.10, 1.20), (-0.95, -0.10), (0.01, 0.40)]
+    if global_search:
+        scan_lows = np.array([b[0] for b in scan_bounds])
+        scan_highs = np.array([b[1] for b in scan_bounds])
+        sampler = qmc.Sobol(d=len(scan_bounds), seed=seed)
+        raw = sampler.random(24)
+        candidates = scan_lows + raw * (scan_highs - scan_lows)
+        candidates = np.vstack([x0_clamped, candidates])
+        scores = np.array([price_objective(c) for c in candidates])
+        # Polish the two best basins and keep the better IV-space fit.
+        start_points = candidates[np.argsort(scores)[:2]]
+    else:
+        start_points = np.array([x0_clamped])
+
+    # Stage 2: polish each retained start in price space -- much cheaper per
+    # evaluation than IV space (a Fourier price, no root-solve), and the two
+    # optima coincide at a good fit. Each polished candidate is then scored
+    # once in IV space; the best IV-space fit is reported.
+    result = None
+    for start in start_points:
+        res = minimize(
+            price_objective, start,
+            method='SLSQP',
+            bounds=bounds,
+            options={'maxiter': 200, 'ftol': 1e-10}
+        )
+        # Guard against a polish that wandered uphill out of its basin.
+        cand_x = res.x if res.fun <= price_objective(start) else np.asarray(start)
+        cand_iv_sse = iv_objective(cand_x)
+        if result is None or cand_iv_sse < result.fun:
+            result = res
+            result.x = cand_x
+            result.fun = cand_iv_sse   # report SSE in IV space
+            result.success = True
 
     if result.success or result.fun < 0.01:
         kappa, theta, xi, rho, V0 = result.x
