@@ -352,37 +352,42 @@ GBM Monte Carlo prices converge to the Black-Scholes-Merton analytical value ($1
 
 ### 9.2 Heston Calibration Quality
 
-The two-stage global calibration—a low-discrepancy Sobol scan followed by an SLSQP polish—fits the Heston parameters to a live SPX surface. On a representative stressed date (27 October 2011, spot 1284, drawn from the historical CBOE dataset), it achieves an implied-volatility sum-of-squared-errors of $4.4\times10^{-3}$ across 40 well-spread contracts subsampled from the liquid chain, with the Feller condition satisfied ($2\kappa\theta - \xi^2 = 0.018 > 0$). The fitted parameters exhibit fast mean reversion ($\kappa=6.4$) and elevated vol-of-vol ($\xi=0.63$), characteristic of a post-selloff regime, together with the strong negative spot–vol correlation ($\rho=-0.70$) typical of equity index options (Table 2).
+The two-stage global calibration—a low-discrepancy Sobol scan followed by an SLSQP polish in a realistic equity-index parameter box—fits the Heston parameters to a live SPX surface. On a representative stressed date (27 October 2011, spot 1284, drawn from the historical CBOE dataset), it reproduces the near-the-money implied-volatility level to roughly **2.4 volatility points** across the ATM band, with a weighted price-space SSE of $4.0\times10^{-3}$ over 40 subsampled contracts (Table 2). The strong negative spot–vol correlation ($\rho=-0.73$) is the expected equity-index leverage effect.
+
+The fit is honest about its limits. A *single* Heston parameter set captures the overall volatility level and the negative-skew direction but cannot match the full steepness of the observed smile, and on this stressed surface the calibrated parameters violate the Feller condition ($2\kappa\theta-\xi^2 < 0$)—the variance process can reach zero. Figure 5 makes this visible: the model tracks the market near the money but flattens relative to the steep short-dated skew. This under-fit at the wings is precisely the theoretical motivation for the Local Stochastic Volatility extension (Section 9.5), whose leverage function corrects exactly this region.
 
 **Table 2: Heston calibration to a live SPX surface** (27 October 2011, spot 1284).
 
 | Metric | Value |
 |---|---|
 | Contracts used | 40 (subsampled from liquid chain) |
-| $\kappa$ (mean reversion) | 6.45 |
-| $\theta$ (long-run variance) | 0.0324 |
-| $\xi$ (vol of vol) | 0.632 |
-| $\rho$ (spot–vol correlation) | −0.702 |
-| $V_0$ (initial variance) | 0.0464 |
-| SSE (implied-vol space) | $4.37\times10^{-3}$ |
-| Feller $2\kappa\theta-\xi^2$ | 0.0184 (satisfied) |
+| $\kappa$ (mean reversion) | 0.82 |
+| $\theta$ (long-run variance) | 0.0419 |
+| $\xi$ (vol of vol) | 0.485 |
+| $\rho$ (spot–vol correlation) | −0.731 |
+| $V_0$ (initial variance) | 0.0423 |
+| SSE (weighted, price space) | $4.0\times10^{-3}$ |
+| ATM-band implied-vol MAE | 2.4 vol pts |
+| Feller $2\kappa\theta-\xi^2$ | −0.17 (violated) |
+
+![Figure 5: Calibrated Heston vs market implied volatility on the 27 October 2011 SPX surface, for three maturities. The model captures the ATM level and negative-skew direction but flattens relative to the steep market smile — the single-Heston limitation that motivates LSV.](figures/heston_calibration.png)
 
 ### 9.3 Scanner Performance
 
 The Fourier-based Heston pricer, using a fixed 128-node Gauss-Legendre rule, values a single option in roughly 0.1 ms—over four orders of magnitude faster than the 252-step Monte Carlo pricer—so an entire multi-hundred-contract chain is repriced in a fraction of a second, enabling interactive scanning. The scanner's bid-ask-aware signal logic (BUY when the model price exceeds the ask; SELL when it falls below the bid) eliminates the phantom edges that midpoint-only analysis produces, and, when calibration is enabled, prices against parameters fitted to the same surface so a reported gap is a genuine residual rather than a parameter mismatch.
 
-Against the 27 October 2011 surface, the calibrated model reprices 393 contracts with a price MAE of \$1.73 and an implied-volatility MAE of 5.1 volatility points; 68% of model prices fall inside the quoted bid–ask, and the mean absolute pricing error is 0.53× the quoted spread—smaller than the trading friction itself (Table 3). The residual IV error reflects the known limitation that a single Heston parameter set cannot perfectly fit an entire multi-maturity smile, which is precisely the motivation for the LSV extension (Section 9.5).
+Across the full 27 October 2011 surface (393 contracts spanning ±15% moneyness and multiple maturities), the calibrated model reprices with a price MAE of \$3.92 and an implied-volatility MAE of 4.7 volatility points; 56% of model prices fall inside the quoted bid–ask, and the mean absolute pricing error is 1.07× the quoted spread (Table 3). The full-surface IV error (4.7 pts) is larger than the near-the-money error (2.4 pts, Section 9.2) because it is dominated by the deep-wing and long-dated contracts the single Heston surface cannot fit—again pointing to LSV (Section 9.5).
 
-**Table 3: Calibrated-model fit against live quotes** (27 October 2011 SPX surface, 393 contracts).
+**Table 3: Calibrated-model fit against live quotes** (27 October 2011 SPX surface, 393 contracts, ±15% moneyness).
 
 | Metric | Value |
 |---|---|
 | Contracts evaluated | 393 |
-| Price MAE | \$1.73 |
-| Price RMSE | \$2.85 |
-| IV MAE | 5.09 vol pts |
-| Within NBBO | 68.4% |
-| Mean abs error / spread | 0.53× |
+| Price MAE | \$3.92 |
+| Price RMSE | \$7.97 |
+| IV MAE | 4.70 vol pts |
+| Within NBBO | 56.2% |
+| Mean abs error / spread | 1.07× |
 
 ### 9.4 Backtester Insights
 
@@ -407,9 +412,9 @@ The delta-hedged backtester produced a sequence of findings that, taken together
 
 ### 9.5 LSV Leverage Surface
 
-The LSV calibration produces leverage matrices that deviate from unity primarily at the wings of the volatility surface, confirming that the Heston base model captures ATM dynamics well but requires correction for deep OTM/ITM strikes—consistent with the theoretical motivation for LSV.
+The LSV calibration produces a leverage surface $L(K,T)$ that departs substantially from unity, most strongly at the strike wings where the Heston base model most under-fits (Figure 6). The surface is, however, visibly noisy: constructing the local-volatility correction requires Dupire-style finite differences of a discretely-sampled market implied-volatility surface, and that differentiation amplifies quote noise—especially at illiquid wing strikes and long maturities. This instability is why the LSV component is presented as a research-grade extension rather than a production calibration; a production implementation would require an arbitrage-free surface smoother (e.g. SVI/SSVI) before differentiation. The qualitative result nonetheless holds: the leverage correction is largest exactly where Section 9.2 showed the single Heston fit failing.
 
-[INSERT FIGURE 6: LSV leverage surface or calibrated surface comparison]
+![Figure 6: LSV leverage surface L(K,T) calibrated to the 27 October 2011 SPX surface. The multiplicative correction to Heston local variance departs from 1 across the surface and most strongly at the wings, but is visibly noisy — an artifact of differentiating a discrete, unsmoothed market IV surface, consistent with the research-grade status of the LSV component.](figures/lsv_leverage_surface.png)
 
 ---
 
@@ -491,9 +496,11 @@ Yahoo Finance. (n.d.). *Yahoo Finance: Stock market live, quotes, business & fin
 
 ![Figure 3: Backtester Tab — Historical delta-hedged strategy backtesting interface showing capital, historical CSV mode, edge threshold, and fair-value model selection.](/Users/Bach/Documents/OTU WINTER 2026/Project/monte_carlo_project/docs/screenshots/backtester.png)
 
-[INSERT FIGURE 4: 3D Greek Surface — Screenshot showing vectorized Gamma or Vega surface across spot price and volatility axes]
+### Figure 4: 3D Greek Surface
 
-[INSERT FIGURE 5: Heston Calibration — Screenshot or diagram showing the calibrated implied volatility surface versus market-observed IVs]
+![Figure 4: Black-Scholes Gamma surface computed analytically over a 60×60 spot–volatility grid (K=1284, T=0.5y). Gamma peaks sharply for at-the-money options at low volatility and flattens as volatility rises, matching theory.](figures/greek_surface.png)
+
+*(Figure 5, the Heston calibration versus market implied volatility, appears in Section 9.2.)*
 
 ---
 
