@@ -192,6 +192,9 @@ def calibrate_heston(options_df, S0, r, q=0.0,
                     V0, kappa, theta, xi, rho,
                     option_type=opt_types[i], q=q
                 )
+                if not np.isfinite(heston_price):
+                    err += weights[i] * 1.0   # penalty for a non-priceable point
+                    continue
                 denom = market_prices[i] if market_prices[i] > 1e-4 else 1e-4
                 err += weights[i] * ((heston_price - market_prices[i]) / denom) ** 2
             except Exception:
@@ -233,11 +236,14 @@ def calibrate_heston(options_df, S0, r, q=0.0,
     # bounded number of cheap price-space evaluations -- unlike a full
     # differential-evolution run, whose thousands of Fourier calls are
     # prohibitively slow in the Feller-violating regions it explores.
-    # The scan samples a realistic equity-index Heston box, not the full
-    # optimizer bounds. The extreme corners (tiny kappa, huge xi/theta)
-    # make the Fourier integrand oscillatory and the quadrature very slow,
-    # and they are not credible calibrations anyway. The SLSQP polish is
-    # still free to leave this box within the full `bounds`.
+    # The scan (and the polish) stay inside a realistic equity-index Heston box
+    # rather than the full optimizer bounds. The extreme corners (tiny kappa,
+    # huge xi/theta) are not credible calibrations, they make the Fourier
+    # integrand oscillate, and — critically — they are where the pricer returns
+    # NaN. Polishing within this box keeps SLSQP away from that NaN "penalty
+    # cliff", whose discontinuous finite-difference gradients otherwise make the
+    # Fortran optimizer non-deterministic (the calibration would land in a
+    # different basin on each identical call).
     scan_bounds = [(0.5, 8.0), (0.01, 0.40), (0.10, 1.20), (-0.95, -0.10), (0.01, 0.40)]
     if global_search:
         scan_lows = np.array([b[0] for b in scan_bounds])
@@ -245,12 +251,14 @@ def calibrate_heston(options_df, S0, r, q=0.0,
         sampler = qmc.Sobol(d=len(scan_bounds), seed=seed)
         raw = sampler.random(24)
         candidates = scan_lows + raw * (scan_highs - scan_lows)
-        candidates = np.vstack([x0_clamped, candidates])
+        candidates = np.vstack([np.clip(x0_clamped, scan_lows, scan_highs), candidates])
         scores = np.array([price_objective(c) for c in candidates])
         # Polish the two best basins and keep the better IV-space fit.
         start_points = candidates[np.argsort(scores)[:2]]
     else:
-        start_points = np.array([x0_clamped])
+        start_points = np.array([np.clip(x0_clamped,
+                                         [b[0] for b in scan_bounds],
+                                         [b[1] for b in scan_bounds])])
 
     # Stage 2: polish each retained start in price space -- much cheaper per
     # evaluation than IV space (a Fourier price, no root-solve), and the two
@@ -261,7 +269,7 @@ def calibrate_heston(options_df, S0, r, q=0.0,
         res = minimize(
             price_objective, start,
             method='SLSQP',
-            bounds=bounds,
+            bounds=scan_bounds,
             options={'maxiter': 200, 'ftol': 1e-10}
         )
         # Guard against a polish that wandered uphill out of its basin.

@@ -259,6 +259,15 @@ def price_option_heston_fourier(S0, K, T, r, V0, kappa, theta, xi, rho,
     u = 0.5 * (b - a) * _GL_NODES + 0.5 * (b + a)
     half_width = 0.5 * (b - a)
 
+    # Deterministic finite fallback for pathological parameters (e.g. a deep
+    # Feller violation) that overflow the characteristic function. Returning a
+    # finite value — never NaN and never a random Monte Carlo price — keeps any
+    # calibration objective reproducible: NaN fed to SLSQP's Fortran core makes
+    # the optimizer non-deterministic, and a random MC fallback makes it worse.
+    # The zero-vol forward intrinsic is the natural finite floor.
+    fwd_intrinsic = max(S0 * np.exp(-q * T) - K * np.exp(-r * T), 0.0) if option_type == 'call' \
+        else max(K * np.exp(-r * T) - S0 * np.exp(-q * T), 0.0)
+
     try:
         phi1 = _heston_characteristic_function(u, S0, T, r, q, V0, kappa, theta, xi, rho, 1)
         phi2 = _heston_characteristic_function(u, S0, T, r, q, V0, kappa, theta, xi, rho, 2)
@@ -266,8 +275,10 @@ def price_option_heston_fourier(S0, K, T, r, V0, kappa, theta, xi, rho,
         P1_integral = half_width * np.dot(_GL_WEIGHTS, np.real(common * phi1))
         P2_integral = half_width * np.dot(_GL_WEIGHTS, np.real(common * phi2))
     except Exception:
-        # Fall back to Monte Carlo if integration fails
-        return price_option_heston(S0, K, T, r, V0, kappa, theta, xi, rho, option_type, n_sims=10000)['price']
+        return float(fwd_intrinsic)
+
+    if not (np.isfinite(P1_integral) and np.isfinite(P2_integral)):
+        return float(fwd_intrinsic)
 
     P1 = 0.5 + P1_integral / np.pi
     P2 = 0.5 + P2_integral / np.pi
